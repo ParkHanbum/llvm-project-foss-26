@@ -1277,231 +1277,263 @@ static bool tryToRecognizeTableBasedCttzOrLog2(Instruction &I,
                                       DL, TTI);
 }
 
-/// This is used by foldLoadsRecursive() to capture a Root Load node which is
-/// of type or(load, load) and recursively build the wide load. Also capture the
-/// shift amount, zero extend type and loadSize.
-struct LoadOps {
-  LoadInst *Root = nullptr;
-  LoadInst *RootInsert = nullptr;
-  bool FoundRoot = false;
-  uint64_t LoadSize = 0;
-  uint64_t Shift = 0;
-  Type *ZextType;
-  AAMDNodes AATags;
+struct AffineShift {
+  Value *Base;
+  APInt Offset;
 };
 
-// Identify and Merge consecutive loads recursively which is of the form
-// (ZExt(L1) << shift1) | (ZExt(L2) << shift2) -> ZExt(L3) << shift1
-// (ZExt(L1) << shift1) | ZExt(L2) -> ZExt(L3)
-static bool foldLoadsRecursive(Value *V, LoadOps &LOps, const DataLayout &DL,
-                               AliasAnalysis &AA, bool IsRoot = false) {
-  uint64_t ShAmt2;
-  Value *X;
-  Instruction *L1, *L2;
+/// Decompose a shift amount into a variable base plus a constant offset. Known
+/// constants include values constrained by dominating assumptions.
+static std::optional<AffineShift>
+decomposeAffineShift(Value *V, const SimplifyQuery &SQ, unsigned Depth = 0) {
+  unsigned BitWidth = V->getType()->getScalarSizeInBits();
+  ConstantRange Range =
+      computeConstantRangeIncludingKnownBits(V, /*ForSigned=*/false, SQ);
+  if (const APInt *C = Range.getSingleElement())
+    return AffineShift{nullptr, *C};
 
-  // For the root instruction, allow multiple uses since the final result
-  // may legitimately be used in multiple places. For intermediate values,
-  // require single use to avoid creating duplicate loads.
-  if (!IsRoot && !V->hasOneUse())
-    return false;
+  if (Depth < 8) {
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      if (BO->getOpcode() == Instruction::Add ||
+          BO->getOpcode() == Instruction::Sub) {
+        auto LHS = decomposeAffineShift(BO->getOperand(0), SQ, Depth + 1);
+        auto RHS = decomposeAffineShift(BO->getOperand(1), SQ, Depth + 1);
+        if (!LHS || !RHS)
+          return std::nullopt;
 
-  if (!match(V, m_c_Or(m_Value(X),
-                       m_OneUse(m_ShlOrSelf(m_OneUse(m_ZExt(m_Instruction(L2))),
-                                            ShAmt2)))))
-    return false;
+        if (BO->getOpcode() == Instruction::Add) {
+          if (LHS->Base && RHS->Base)
+            return std::nullopt;
+          return AffineShift{LHS->Base ? LHS->Base : RHS->Base,
+                             LHS->Offset + RHS->Offset};
+        }
 
-  if (!foldLoadsRecursive(X, LOps, DL, AA, /*IsRoot=*/false) && LOps.FoundRoot)
-    // Avoid Partial chain merge.
-    return false;
-
-  // Check if the pattern has loads
-  LoadInst *LI1 = LOps.Root;
-  uint64_t ShAmt1 = LOps.Shift;
-  if (LOps.FoundRoot == false &&
-      match(X, m_OneUse(
-                   m_ShlOrSelf(m_OneUse(m_ZExt(m_Instruction(L1))), ShAmt1)))) {
-    LI1 = dyn_cast<LoadInst>(L1);
+        if (RHS->Base)
+          return std::nullopt;
+        return AffineShift{LHS->Base, LHS->Offset - RHS->Offset};
+      }
+    }
   }
-  LoadInst *LI2 = dyn_cast<LoadInst>(L2);
 
-  // Check if loads are same, atomic, volatile and having same address space.
-  if (LI1 == LI2 || !LI1 || !LI2 || !LI1->isSimple() || !LI2->isSimple() ||
-      LI1->getPointerAddressSpace() != LI2->getPointerAddressSpace())
+  return AffineShift{V, APInt(BitWidth, 0)};
+}
+
+struct LoadTerm {
+  LoadInst *Load;
+  Value *Shift;
+  Value *ShiftBase;
+  APInt ShiftOffset;
+  APInt PointerOffset;
+};
+
+/// Fold adjacent loads whose values are packed at constant offsets from a
+/// common shift. Constant shifts are represented as offsets from a null base,
+/// while variable shifts share the same non-null base.
+static bool foldConsecutiveLoads(Instruction &I, const DataLayout &DL,
+                                 TargetTransformInfo &TTI, AliasAnalysis &AA,
+                                 AssumptionCache &AC, const DominatorTree &DT) {
+  if (I.getOpcode() != Instruction::Or || !I.getType()->isIntegerTy())
     return false;
 
-  // Check if Loads come from same BB.
-  if (LI1->getParent() != LI2->getParent())
-    return false;
+  SmallVector<Value *, 8> Worklist(I.operands());
+  SmallVector<Value *, 8> Terms;
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    auto *Or = dyn_cast<BinaryOperator>(V);
+    if (Or && Or->getOpcode() == Instruction::Or && Or->hasOneUse()) {
+      Worklist.push_back(Or->getOperand(0));
+      Worklist.push_back(Or->getOperand(1));
+      continue;
+    }
+    Terms.push_back(V);
+  }
 
-  // Find the data layout
-  bool IsBigEndian = DL.isBigEndian();
+  SimplifyQuery SQ(DL, /*TLI=*/nullptr, &DT, &AC, &I);
+  SmallVector<LoadTerm, 8> Loads;
+  SmallVector<Value *, 4> OtherTerms;
+  Value *PointerBase = nullptr;
+  unsigned DestBitWidth = I.getType()->getIntegerBitWidth();
+  unsigned AddressSpace = 0;
 
-  // Check if loads are consecutive and same size.
-  Value *Load1Ptr = LI1->getPointerOperand();
-  APInt Offset1(DL.getIndexTypeSizeInBits(Load1Ptr->getType()), 0);
-  Load1Ptr =
-      Load1Ptr->stripAndAccumulateConstantOffsets(DL, Offset1,
-                                                  /* AllowNonInbounds */ true);
+  for (Value *Term : Terms) {
+    Value *Shift = nullptr;
+    Value *ZExtValue = Term;
+    if (auto *Shl = dyn_cast<BinaryOperator>(Term);
+        Shl && Shl->getOpcode() == Instruction::Shl && Shl->hasOneUse()) {
+      ZExtValue = Shl->getOperand(0);
+      Shift = Shl->getOperand(1);
+    }
 
-  Value *Load2Ptr = LI2->getPointerOperand();
-  APInt Offset2(DL.getIndexTypeSizeInBits(Load2Ptr->getType()), 0);
-  Load2Ptr =
-      Load2Ptr->stripAndAccumulateConstantOffsets(DL, Offset2,
-                                                  /* AllowNonInbounds */ true);
+    auto *ZExt = dyn_cast<ZExtInst>(ZExtValue);
+    auto *Load = ZExt && ZExt->hasOneUse()
+                     ? dyn_cast<LoadInst>(ZExt->getOperand(0))
+                     : nullptr;
+    if (!Load || ZExt->getType() != I.getType() || !Load->isSimple() ||
+        !Load->getType()->isIntegerTy() ||
+        !DL.typeSizeEqualsStoreSize(Load->getType())) {
+      OtherTerms.push_back(Term);
+      continue;
+    }
 
-  // Verify if both loads have same base pointers
-  uint64_t LoadSize1 = LI1->getType()->getPrimitiveSizeInBits();
-  uint64_t LoadSize2 = LI2->getType()->getPrimitiveSizeInBits();
-  if (Load1Ptr != Load2Ptr)
-    return false;
-
-  // Make sure that there are no padding bits.
-  if (!DL.typeSizeEqualsStoreSize(LI1->getType()) ||
-      !DL.typeSizeEqualsStoreSize(LI2->getType()))
-    return false;
-
-  // Alias Analysis to check for stores b/w the loads.
-  LoadInst *Start = LOps.FoundRoot ? LOps.RootInsert : LI1, *End = LI2;
-  MemoryLocation Loc;
-  if (!Start->comesBefore(End)) {
-    std::swap(Start, End);
-    // If LOps.RootInsert comes after LI2, since we use LI2 as the new insert
-    // point, we should make sure whether the memory region accessed by LOps
-    // isn't modified.
-    if (LOps.FoundRoot)
-      Loc = MemoryLocation(
-          LOps.Root->getPointerOperand(),
-          LocationSize::precise(DL.getTypeStoreSize(
-              IntegerType::get(LI1->getContext(), LOps.LoadSize))),
-          LOps.AATags);
+    std::optional<AffineShift> Affine;
+    if (Shift)
+      Affine = decomposeAffineShift(Shift, SQ);
     else
-      Loc = MemoryLocation::get(End);
-  } else
-    Loc = MemoryLocation::get(End);
-  unsigned NumScanned = 0;
-  for (Instruction &Inst :
-       make_range(Start->getIterator(), End->getIterator())) {
-    if (Inst.mayWriteToMemory() && isModSet(AA.getModRefInfo(&Inst, Loc)))
+      Affine = AffineShift{nullptr, APInt(DestBitWidth, 0)};
+    if (!Affine)
       return false;
 
+    ConstantRange ShiftRange(Affine->Offset);
+    if (Affine->Base) {
+      ConstantRange BaseRange = computeConstantRangeIncludingKnownBits(
+          Affine->Base, /*ForSigned=*/false, SQ);
+      ShiftRange = BaseRange.add(ShiftRange);
+    }
+    if (ShiftRange.getUnsignedMax().uge(DestBitWidth))
+      return false;
+
+    if (Loads.empty())
+      AddressSpace = Load->getPointerAddressSpace();
+    else if (AddressSpace != Load->getPointerAddressSpace() ||
+             Load->getParent() != Loads.front().Load->getParent())
+      return false;
+
+    Value *Ptr = Load->getPointerOperand();
+    APInt PtrOffset(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+    Value *Base = Ptr->stripAndAccumulateConstantOffsets(
+        DL, PtrOffset, /*AllowNonInbounds=*/true);
+    if (!PointerBase)
+      PointerBase = Base;
+    else if (PointerBase != Base)
+      return false;
+
+    Loads.push_back({Load, Shift, Affine->Base, Affine->Offset, PtrOffset});
+  }
+
+  if (Loads.size() < 2)
+    return false;
+
+  Value *ShiftBase = Loads.front().ShiftBase;
+  for (const LoadTerm &Load : drop_begin(Loads))
+    if (Load.ShiftBase != ShiftBase)
+      return false;
+
+  // Non-load terms, such as an accumulator, are only supported for a common
+  // variable shift. Preserve the legacy all-load requirement for constants.
+  if (!ShiftBase && !OtherTerms.empty())
+    return false;
+
+  // Variable-shift packing is currently supported only for equal-sized loads
+  // on little-endian targets.
+  if (ShiftBase) {
+    if (DL.isBigEndian())
+      return false;
+    Type *LoadType = Loads.front().Load->getType();
+    for (const LoadTerm &Load : drop_begin(Loads))
+      if (Load.Load->getType() != LoadType)
+        return false;
+  }
+
+  llvm::sort(Loads, [](const LoadTerm &LHS, const LoadTerm &RHS) {
+    return LHS.PointerOffset.slt(RHS.PointerOffset);
+  });
+
+  uint64_t WideBitWidth = 0;
+  for (const LoadTerm &Load : Loads)
+    WideBitWidth += Load.Load->getType()->getIntegerBitWidth();
+  if (WideBitWidth > DestBitWidth)
+    return false;
+
+  APInt MinShiftOffset = Loads.front().ShiftOffset;
+  Value *CommonShift = Loads.front().Shift;
+  for (const LoadTerm &Load : drop_begin(Loads)) {
+    if (Load.ShiftOffset.slt(MinShiftOffset)) {
+      MinShiftOffset = Load.ShiftOffset;
+      CommonShift = Load.Shift;
+    }
+  }
+
+  APInt FirstPointerOffset = Loads.front().PointerOffset;
+  uint64_t BitOffset = 0;
+  uint64_t ByteOffset = 0;
+  for (const LoadTerm &Load : Loads) {
+    uint64_t LoadBitWidth = Load.Load->getType()->getIntegerBitWidth();
+    uint64_t LoadStoreSize = DL.getTypeStoreSize(Load.Load->getType());
+    if (Load.PointerOffset - FirstPointerOffset != ByteOffset)
+      return false;
+
+    uint64_t ExpectedShift = DL.isLittleEndian()
+                                 ? BitOffset
+                                 : WideBitWidth - BitOffset - LoadBitWidth;
+    if (Load.ShiftOffset - MinShiftOffset != ExpectedShift)
+      return false;
+
+    BitOffset += LoadBitWidth;
+    ByteOffset += LoadStoreSize;
+  }
+
+  IntegerType *WiderType = IntegerType::get(I.getContext(), WideBitWidth);
+  if (!TTI.isTypeLegal(WiderType))
+    return false;
+
+  LoadInst *LowLoad = Loads.front().Load;
+  unsigned Fast = 0;
+  if (!TTI.allowsMisalignedMemoryAccesses(I.getContext(), WideBitWidth,
+                                          AddressSpace, LowLoad->getAlign(),
+                                          &Fast) ||
+      !Fast)
+    return false;
+
+  LoadInst *InsertLoad = Loads.front().Load;
+  LoadInst *LastLoad = InsertLoad;
+  AAMDNodes AATags = Loads.front().Load->getAAMetadata();
+  for (const LoadTerm &Load : drop_begin(Loads)) {
+    if (Load.Load->comesBefore(InsertLoad))
+      InsertLoad = Load.Load;
+    if (LastLoad->comesBefore(Load.Load))
+      LastLoad = Load.Load;
+    AATags = AATags.concat(Load.Load->getAAMetadata());
+  }
+
+  unsigned NumScanned = 0;
+  for (Instruction &Inst :
+       make_range(InsertLoad->getIterator(), LastLoad->getIterator())) {
+    if (Inst.mayWriteToMemory()) {
+      for (const LoadTerm &Load : Loads) {
+        if (Inst.comesBefore(Load.Load) &&
+            isModSet(AA.getModRefInfo(&Inst, MemoryLocation::get(Load.Load))))
+          return false;
+      }
+    }
     if (++NumScanned > MaxInstrsToScan)
       return false;
   }
 
-  // Make sure Load with lower Offset is at LI1
-  bool Reverse = false;
-  if (Offset2.slt(Offset1)) {
-    std::swap(LI1, LI2);
-    std::swap(ShAmt1, ShAmt2);
-    std::swap(Offset1, Offset2);
-    std::swap(Load1Ptr, Load2Ptr);
-    std::swap(LoadSize1, LoadSize2);
-    Reverse = true;
+  IRBuilder<> LoadBuilder(InsertLoad);
+  Value *LoadPtr = LowLoad->getPointerOperand();
+  if (!DT.dominates(LoadPtr, InsertLoad)) {
+    if (!DT.dominates(PointerBase, InsertLoad))
+      return false;
+    LoadPtr = LoadBuilder.CreatePtrAdd(PointerBase,
+                                       LoadBuilder.getInt(FirstPointerOffset));
   }
 
-  // Big endian swap the shifts
-  if (IsBigEndian)
-    std::swap(ShAmt1, ShAmt2);
+  auto *WideLoad = LoadBuilder.CreateAlignedLoad(
+      WiderType, LoadPtr, LowLoad->getAlign(), /*isVolatile=*/false);
+  WideLoad->takeName(LowLoad);
+  if (AATags)
+    WideLoad->setAAMetadata(AATags);
 
-  // First load is always LI1. This is where we put the new load.
-  // Use the merged load size available from LI1 for forward loads.
-  if (LOps.FoundRoot) {
-    if (!Reverse)
-      LoadSize1 = LOps.LoadSize;
-    else
-      LoadSize2 = LOps.LoadSize;
-  }
-
-  // Verify if shift amount and load index aligns and verifies that loads
-  // are consecutive.
-  uint64_t ShiftDiff = IsBigEndian ? LoadSize2 : LoadSize1;
-  uint64_t PrevSize =
-      DL.getTypeStoreSize(IntegerType::get(LI1->getContext(), LoadSize1));
-  if ((ShAmt2 - ShAmt1) != ShiftDiff || (Offset2 - Offset1) != PrevSize)
-    return false;
-
-  // Reject if the combined size of the loads exceeds the target type size.
-  // This avoids attempting to emit an invalid ZExt (from wider to narrower
-  // type) when out-of-bounds shifts lead to matching too many loads.
-  if (LoadSize1 + LoadSize2 > X->getType()->getScalarSizeInBits())
-    return false;
-
-  // Update LOps
-  AAMDNodes AATags1 = LOps.AATags;
-  AAMDNodes AATags2 = LI2->getAAMetadata();
-  if (LOps.FoundRoot == false) {
-    LOps.FoundRoot = true;
-    AATags1 = LI1->getAAMetadata();
-  }
-  LOps.LoadSize = LoadSize1 + LoadSize2;
-  LOps.RootInsert = Start;
-
-  // Concatenate the AATags of the Merged Loads.
-  LOps.AATags = AATags1.concat(AATags2);
-
-  LOps.Root = LI1;
-  LOps.Shift = ShAmt1;
-  LOps.ZextType = X->getType();
-  return true;
-}
-
-// For a given BB instruction, evaluate all loads in the chain that form a
-// pattern which suggests that the loads can be combined. The one and only use
-// of the loads is to form a wider load.
-static bool foldConsecutiveLoads(Instruction &I, const DataLayout &DL,
-                                 TargetTransformInfo &TTI, AliasAnalysis &AA,
-                                 const DominatorTree &DT) {
-  // Only consider load chains of scalar values.
-  if (isa<VectorType>(I.getType()))
-    return false;
-
-  LoadOps LOps;
-  if (!foldLoadsRecursive(&I, LOps, DL, AA, /*IsRoot=*/true) || !LOps.FoundRoot)
-    return false;
-
-  IRBuilder<> Builder(&I);
-  LoadInst *NewLoad = nullptr, *LI1 = LOps.Root;
-
-  IntegerType *WiderType = IntegerType::get(I.getContext(), LOps.LoadSize);
-  // TTI based checks if we want to proceed with wider load
-  bool Allowed = TTI.isTypeLegal(WiderType);
-  if (!Allowed)
-    return false;
-
-  unsigned AS = LI1->getPointerAddressSpace();
-  unsigned Fast = 0;
-  Allowed = TTI.allowsMisalignedMemoryAccesses(I.getContext(), LOps.LoadSize,
-                                               AS, LI1->getAlign(), &Fast);
-  if (!Allowed || !Fast)
-    return false;
-
-  // Get the Index and Ptr for the new GEP.
-  Value *Load1Ptr = LI1->getPointerOperand();
-  Builder.SetInsertPoint(LOps.RootInsert);
-  if (!DT.dominates(Load1Ptr, LOps.RootInsert)) {
-    APInt Offset1(DL.getIndexTypeSizeInBits(Load1Ptr->getType()), 0);
-    Load1Ptr = Load1Ptr->stripAndAccumulateConstantOffsets(
-        DL, Offset1, /* AllowNonInbounds */ true);
-    Load1Ptr = Builder.CreatePtrAdd(Load1Ptr, Builder.getInt(Offset1));
-  }
-  // Generate wider load.
-  NewLoad = Builder.CreateAlignedLoad(WiderType, Load1Ptr, LI1->getAlign(),
-                                      LI1->isVolatile(), "");
-  NewLoad->takeName(LI1);
-  // Set the New Load AATags Metadata.
-  if (LOps.AATags)
-    NewLoad->setAAMetadata(LOps.AATags);
-
-  Value *NewOp = NewLoad;
-  // Zero extend if needed.
-  NewOp = Builder.CreateZExt(NewOp, LOps.ZextType);
-
-  // Check if shift needed. We need to shift with the amount of load1
-  // shift if not zero.
-  if (LOps.Shift)
-    NewOp = Builder.CreateShl(NewOp, LOps.Shift);
-  I.replaceAllUsesWith(NewOp);
-
+  IRBuilder<> RootBuilder(&I);
+  IRBuilder<> &Builder = ShiftBase ? RootBuilder : LoadBuilder;
+  Value *Packed = Builder.CreateZExt(WideLoad, I.getType());
+  if (ShiftBase)
+    Packed = Builder.CreateShl(Packed, CommonShift);
+  else if (!MinShiftOffset.isZero())
+    Packed = Builder.CreateShl(Packed, Builder.getInt(MinShiftOffset));
+  for (Value *Term : OtherTerms)
+    Packed = Builder.CreateOr(Term, Packed);
+  I.replaceAllUsesWith(Packed);
   return true;
 }
 
@@ -1701,7 +1733,7 @@ static Value *optimizeShiftInOrChain(Value *V, IRBuilder<> &Builder) {
 
 static bool foldICmpOrChain(Instruction &I, const DataLayout &DL,
                             TargetTransformInfo &TTI, AliasAnalysis &AA,
-                            const DominatorTree &DT) {
+                            AssumptionCache &AC, const DominatorTree &DT) {
   CmpPredicate Pred;
   Value *Op0;
   if (!match(&I, m_ICmp(Pred, m_Value(Op0), m_Zero())) ||
@@ -1712,7 +1744,7 @@ static bool foldICmpOrChain(Instruction &I, const DataLayout &DL,
   // remove shifts.
   if (auto OpI = dyn_cast<Instruction>(Op0))
     if (OpI->getOpcode() == Instruction::Or)
-      if (foldConsecutiveLoads(*OpI, DL, TTI, AA, DT))
+      if (foldConsecutiveLoads(*OpI, DL, TTI, AA, AC, DT))
         return true;
 
   IRBuilder<> Builder(&I);
@@ -2488,9 +2520,9 @@ static bool foldUnusualPatterns(Function &F, DominatorTree &DT,
       MadeChange |= tryToRecognizePopCount2n3(I);
       MadeChange |= tryToFPToSat(I, TTI);
       MadeChange |= tryToRecognizeTableBasedCttzOrLog2(I, DL, TTI);
-      MadeChange |= foldConsecutiveLoads(I, DL, TTI, AA, DT);
+      MadeChange |= foldConsecutiveLoads(I, DL, TTI, AA, AC, DT);
       MadeChange |= foldPatternedLoads(I, DL);
-      MadeChange |= foldICmpOrChain(I, DL, TTI, AA, DT);
+      MadeChange |= foldICmpOrChain(I, DL, TTI, AA, AC, DT);
       MadeChange |= foldMulHigh(I);
       // NOTE: This function introduces erasing of the instruction `I`, so it
       // needs to be called at the end of this sequence, otherwise we may make

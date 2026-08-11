@@ -16,28 +16,11 @@ define i64 @pack4_i8_le_shift_var_step(ptr %p, i64 %acc, i64 %s, i64 %step) {
 ; LE-NEXT:    [[STEP2:%.*]] = shl i64 [[STEP]], 1
 ; LE-NEXT:    [[STEP3:%.*]] = add i64 [[STEP2]], [[STEP]]
 ; LE-NEXT:    [[S0:%.*]] = sub nsw i64 [[S]], [[STEP3]]
-; LE-NEXT:    [[B0:%.*]] = load i8, ptr [[P]], align 1
-; LE-NEXT:    [[Z0:%.*]] = zext i8 [[B0]] to i64
+; LE-NEXT:    [[B0:%.*]] = load i32, ptr [[P]], align 1
+; LE-NEXT:    [[Z0:%.*]] = zext i32 [[B0]] to i64
 ; LE-NEXT:    [[SH0:%.*]] = shl i64 [[Z0]], [[S0]]
 ; LE-NEXT:    [[OR0:%.*]] = or i64 [[ACC]], [[SH0]]
-; LE-NEXT:    [[P1:%.*]] = getelementptr i8, ptr [[P]], i64 1
-; LE-NEXT:    [[S1:%.*]] = sub nsw i64 [[S]], [[STEP2]]
-; LE-NEXT:    [[B1:%.*]] = load i8, ptr [[P1]], align 1
-; LE-NEXT:    [[Z1:%.*]] = zext i8 [[B1]] to i64
-; LE-NEXT:    [[SH1:%.*]] = shl i64 [[Z1]], [[S1]]
-; LE-NEXT:    [[OR1:%.*]] = or i64 [[OR0]], [[SH1]]
-; LE-NEXT:    [[P2:%.*]] = getelementptr i8, ptr [[P]], i64 2
-; LE-NEXT:    [[S2:%.*]] = sub nsw i64 [[S]], [[STEP]]
-; LE-NEXT:    [[B2:%.*]] = load i8, ptr [[P2]], align 1
-; LE-NEXT:    [[Z2:%.*]] = zext i8 [[B2]] to i64
-; LE-NEXT:    [[SH2:%.*]] = shl i64 [[Z2]], [[S2]]
-; LE-NEXT:    [[OR2:%.*]] = or i64 [[OR1]], [[SH2]]
-; LE-NEXT:    [[P3:%.*]] = getelementptr i8, ptr [[P]], i64 3
-; LE-NEXT:    [[B3:%.*]] = load i8, ptr [[P3]], align 1
-; LE-NEXT:    [[Z3:%.*]] = zext i8 [[B3]] to i64
-; LE-NEXT:    [[SH3:%.*]] = shl i64 [[Z3]], [[S]]
-; LE-NEXT:    [[R:%.*]] = or i64 [[OR2]], [[SH3]]
-; LE-NEXT:    ret i64 [[R]]
+; LE-NEXT:    ret i64 [[OR0]]
 ;
 ; BE-LABEL: define i64 @pack4_i8_le_shift_var_step(
 ; BE-SAME: ptr [[P:%.*]], i64 [[ACC:%.*]], i64 [[S:%.*]], i64 [[STEP:%.*]]) #[[ATTR1:[0-9]+]] {
@@ -203,14 +186,7 @@ define i64 @no_fold_across_clobber(ptr %p, ptr %q, i64 %acc, i64 %s) {
 ; LE-NEXT:    [[HI:%.*]] = icmp ult i64 [[S]], 64
 ; LE-NEXT:    call void @llvm.assume(i1 [[HI]])
 ; LE-NEXT:    [[S0:%.*]] = sub i64 [[S]], 24
-; LE-NEXT:    [[B0:%.*]] = load i8, ptr [[P]], align 1
-; LE-NEXT:    [[Z0:%.*]] = zext i8 [[B0]] to i64
-; LE-NEXT:    [[TMP3:%.*]] = shl i64 [[Z0]], [[S0]]
-; LE-NEXT:    [[P1:%.*]] = getelementptr i8, ptr [[P]], i64 1
-; LE-NEXT:    [[S1:%.*]] = sub i64 [[S]], 16
-; LE-NEXT:    [[B1:%.*]] = load i8, ptr [[P1]], align 1
-; LE-NEXT:    [[Z1:%.*]] = zext i8 [[B1]] to i64
-; LE-NEXT:    [[SH1:%.*]] = shl i64 [[Z1]], [[S1]]
+; LE-NEXT:    [[B0:%.*]] = load i16, ptr [[P]], align 1
 ; LE-NEXT:    store i8 0, ptr [[Q]], align 1
 ; LE-NEXT:    [[P2:%.*]] = getelementptr i8, ptr [[P]], i64 2
 ; LE-NEXT:    [[S2:%.*]] = sub i64 [[S]], 8
@@ -221,9 +197,10 @@ define i64 @no_fold_across_clobber(ptr %p, ptr %q, i64 %acc, i64 %s) {
 ; LE-NEXT:    [[B3:%.*]] = load i8, ptr [[P3]], align 1
 ; LE-NEXT:    [[Z3:%.*]] = zext i8 [[B3]] to i64
 ; LE-NEXT:    [[SH3:%.*]] = shl i64 [[Z3]], [[S]]
+; LE-NEXT:    [[TMP1:%.*]] = zext i16 [[B0]] to i64
+; LE-NEXT:    [[TMP3:%.*]] = shl i64 [[TMP1]], [[S0]]
 ; LE-NEXT:    [[TMP4:%.*]] = or i64 [[ACC]], [[TMP3]]
-; LE-NEXT:    [[OR1:%.*]] = or i64 [[TMP4]], [[SH1]]
-; LE-NEXT:    [[OR2:%.*]] = or i64 [[OR1]], [[SH2]]
+; LE-NEXT:    [[OR2:%.*]] = or i64 [[TMP4]], [[SH2]]
 ; LE-NEXT:    [[R:%.*]] = or i64 [[OR2]], [[SH3]]
 ; LE-NEXT:    ret i64 [[R]]
 ;
