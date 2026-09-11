@@ -283,6 +283,12 @@ class ConstraintInfo {
 
   const DataLayout &DL;
 
+  // Opposite-sign add checks can recursively query operand constraints. Share
+  // a budget across one outermost constraint construction to avoid exponential
+  // work on chains of unflagged additions whose operand signs are unknown.
+  mutable unsigned ConstraintQueryDepth = 0;
+  mutable unsigned RemainingAddSignChecks = 0;
+
 public:
   ConstraintInfo(const DataLayout &DL, ArrayRef<Value *> FunctionArgs)
       : UnsignedCS(FunctionArgs), SignedCS(FunctionArgs), DL(DL) {
@@ -318,8 +324,25 @@ public:
   /// signed system implies it or because ValueTracking can prove it.
   bool isKnownNonNegative(Value *V) const;
 
+  bool consumeAddSignCheck() const {
+    assert(ConstraintQueryDepth && "expected an active constraint query");
+    if (!RemainingAddSignChecks)
+      return false;
+    --RemainingAddSignChecks;
+    return true;
+  }
+
   void addFact(CmpInst::Predicate Pred, Value *A, Value *B, unsigned NumIn,
                unsigned NumOut, SmallVectorImpl<StackEntry> &DFSInStack);
+
+  /// Add a fact of the form (\p AScale * \p A + \p AOffset) \p Pred \p B.
+  /// The scale and offset use mathematical, non-wrapping arithmetic, including
+  /// when the scaled expression is outside the range of the IR integer type.
+  /// This is used for relations that are implicit in an instruction and do not
+  /// have a corresponding scaled value in the IR.
+  void addScaledFact(CmpInst::Predicate Pred, Value *A, int64_t AScale,
+                     int64_t AOffset, Value *B, unsigned NumIn, unsigned NumOut,
+                     SmallVectorImpl<StackEntry> &DFSInStack);
 
   /// Turn a comparison of the form \p Op0 \p Pred \p Op1 into a vector of
   /// constraints, using indices from the corresponding constraint system.
@@ -327,7 +350,9 @@ public:
   /// \p NewVariables.
   ConstraintTy getConstraint(CmpInst::Predicate Pred, Value *Op0, Value *Op1,
                              SmallVectorImpl<Value *> &NewVariables,
-                             bool ForceSignedSystem = false) const;
+                             bool ForceSignedSystem = false,
+                             int64_t Op0Scale = 1,
+                             int64_t Op0Offset = 0) const;
 
   /// Turns a comparison of the form \p Op0 \p Pred \p Op1 into a vector of
   /// constraints using getConstraint. Returns an empty constraint if the result
@@ -351,7 +376,8 @@ private:
   /// specified.
   void addFactImpl(CmpInst::Predicate Pred, Value *A, Value *B, unsigned NumIn,
                    unsigned NumOut, SmallVectorImpl<StackEntry> &DFSInStack,
-                   bool ForceSignedSystem);
+                   bool ForceSignedSystem, int64_t AScale = 1,
+                   int64_t AOffset = 0);
 
   /// Try to use the inequality \p A != \p B to tighten a non-strict bound the
   /// system already implies to the corresponding strict bound.
@@ -580,6 +606,30 @@ static Decomposition decompose(Value *V, const ConstraintInfo &Info,
       return V;
     }
 
+    // An addition of a non-negative value and a non-positive value cannot
+    // signed-wrap. Use dominating constraints to recognize this even when the
+    // add did not attach nsw. Requiring the operands themselves to decompose
+    // below keeps wrapped expressions opaque unless their own no-wrap
+    // preconditions can also be proven.
+    if (V->getType()->isIntegerTy() &&
+        match(V, m_Add(m_Value(Op0), m_Value(Op1)))) {
+      if (!Info.consumeAddSignCheck())
+        return V;
+      auto IsNonNegative = [&](Value *Op) {
+        return isKnownNonNegative(Op, DL) ||
+               preconditionHolds(Info, CmpInst::ICMP_SGE, Op, 0);
+      };
+      auto IsNonPositive = [&](Value *Op) {
+        return preconditionHolds(Info, CmpInst::ICMP_SLE, Op, 0);
+      };
+      if ((IsNonNegative(Op0) && IsNonPositive(Op1)) ||
+          (IsNonNegative(Op1) && IsNonPositive(Op0))) {
+        if (auto Decomp = MergeResults(Op0, Op1, IsSigned))
+          return *Decomp;
+      }
+      return V;
+    }
+
     // `xor %x, -1` is equivalent to `sub nsw -1, %x`.
     if (match(V, m_Not(m_Value(Op0)))) {
       Decomposition Result(-1);
@@ -718,10 +768,19 @@ static Decomposition decompose(Value *V, const ConstraintInfo &Info,
 ConstraintTy
 ConstraintInfo::getConstraint(CmpInst::Predicate Pred, Value *Op0, Value *Op1,
                               SmallVectorImpl<Value *> &NewVariables,
-                              bool ForceSignedSystem) const {
+                              bool ForceSignedSystem, int64_t Op0Scale,
+                              int64_t Op0Offset) const {
   assert(NewVariables.empty() && "NewVariables must be empty when passed in");
   assert((!ForceSignedSystem || CmpInst::isEquality(Pred)) &&
          "signed system can only be forced on eq/ne");
+
+  if (ConstraintQueryDepth++ == 0)
+    RemainingAddSignChecks = 64;
+
+  llvm::scope_exit QueryGuard([&] { --ConstraintQueryDepth; });
+
+  int64_t Op1Scale = 1;
+  int64_t Op1Offset = 0;
 
   bool IsEq = false;
   bool IsNe = false;
@@ -734,6 +793,8 @@ ConstraintInfo::getConstraint(CmpInst::Predicate Pred, Value *Op0, Value *Op1,
   case CmpInst::ICMP_SGE: {
     Pred = CmpInst::getSwappedPredicate(Pred);
     std::swap(Op0, Op1);
+    std::swap(Op0Scale, Op1Scale);
+    std::swap(Op0Offset, Op1Offset);
     break;
   }
   case CmpInst::ICMP_EQ:
@@ -748,6 +809,8 @@ ConstraintInfo::getConstraint(CmpInst::Predicate Pred, Value *Op0, Value *Op1,
     if (!ForceSignedSystem && match(Op1, m_Zero())) {
       Pred = CmpInst::getSwappedPredicate(CmpInst::ICMP_UGT);
       std::swap(Op0, Op1);
+      std::swap(Op0Scale, Op1Scale);
+      std::swap(Op0Offset, Op1Offset);
     } else {
       IsNe = true;
       Pred = CmpInst::ICMP_ULE;
@@ -767,6 +830,9 @@ ConstraintInfo::getConstraint(CmpInst::Predicate Pred, Value *Op0, Value *Op1,
                         IsSigned, DL);
   auto BDec = decompose(Op1->stripPointerCastsSameRepresentation(), *this,
                         IsSigned, DL);
+  if (ADec.mul(Op0Scale) || ADec.add(Op0Offset) || BDec.mul(Op1Scale) ||
+      BDec.add(Op1Offset))
+    return {};
   int64_t Offset1 = ADec.Offset;
   int64_t Offset2 = BDec.Offset;
   if (MulOverflow(Offset1, int64_t(-1), Offset1))
@@ -799,8 +865,11 @@ ConstraintInfo::getConstraint(CmpInst::Predicate Pred, Value *Op0, Value *Op1,
       I = R.insert(I, Entry(0, Idx));
     return I->Coefficient;
   };
-  for (const auto &KV : VariablesA)
-    GetCoefficient(GetOrAddIndex(KV.Variable)) += KV.Coefficient;
+  for (const auto &KV : VariablesA) {
+    auto &Coeff = GetCoefficient(GetOrAddIndex(KV.Variable));
+    if (AddOverflow(Coeff, KV.Coefficient, Coeff))
+      return {};
+  }
 
   for (const auto &KV : VariablesB) {
     auto &Coeff = GetCoefficient(GetOrAddIndex(KV.Variable));
@@ -1655,13 +1724,17 @@ namespace {
 /// for reproducer construction.
 /// Pred == Predicate::BAD_ICMP_PREDICATE indicates that this entry is a
 /// placeholder to keep the ReproducerCondStack in sync with DFSInStack.
+/// ImplicitFact, when non-null, is an instruction whose semantics must be
+/// preserved instead of treating its result as an independent input.
 struct ReproducerEntry {
   ICmpInst::Predicate Pred;
   Value *LHS;
   Value *RHS;
+  Instruction *ImplicitFact;
 
-  ReproducerEntry(ICmpInst::Predicate Pred, Value *LHS, Value *RHS)
-      : Pred(Pred), LHS(LHS), RHS(RHS) {}
+  ReproducerEntry(ICmpInst::Predicate Pred, Value *LHS, Value *RHS,
+                  Instruction *ImplicitFact = nullptr)
+      : Pred(Pred), LHS(LHS), RHS(RHS), ImplicitFact(ImplicitFact) {}
 };
 } // namespace
 
@@ -1685,6 +1758,10 @@ static void generateReproducer(Instruction *Cond, bool IsSigned, Module *M,
   ValueToValueMapTy Old2New;
   SmallVector<Value *> Args;
   SmallPtrSet<Value *, 8> Seen;
+  SmallPtrSet<Value *, 8> ImplicitFacts;
+  for (const auto &Entry : Stack)
+    if (Entry.ImplicitFact)
+      ImplicitFacts.insert(Entry.ImplicitFact);
   // Traverse Cond and its operands recursively until we reach a value that's in
   // Value2Index or not an instruction, or not a operation that
   // ConstraintElimination can decompose. Such values will be considered as
@@ -1703,7 +1780,7 @@ static void generateReproducer(Instruction *Cond, bool IsSigned, Module *M,
         continue;
 
       auto *I = dyn_cast<Instruction>(V);
-      if (Value2Index.contains(V) || !I ||
+      if ((Value2Index.contains(V) && !ImplicitFacts.contains(V)) || !I ||
           !isa<CmpInst, BinaryOperator, GEPOperator, CastInst>(V)) {
         Old2New[V] = V;
         Args.push_back(V);
@@ -1714,6 +1791,9 @@ static void generateReproducer(Instruction *Cond, bool IsSigned, Module *M,
     }
   };
 
+  for (const auto &Entry : Stack)
+    if (Entry.ImplicitFact)
+      CollectArguments(Entry.ImplicitFact, /*IsSigned=*/false);
   for (auto &Entry : Stack)
     if (Entry.Pred != ICmpInst::BAD_ICMP_PREDICATE)
       CollectArguments({Entry.LHS, Entry.RHS}, ICmpInst::isSigned(Entry.Pred));
@@ -1754,7 +1834,7 @@ static void generateReproducer(Instruction *Cond, bool IsSigned, Module *M,
         continue;
 
       auto *I = dyn_cast<Instruction>(V);
-      if (!Value2Index.contains(V) && I) {
+      if (I && (!Value2Index.contains(V) || ImplicitFacts.contains(V))) {
         Old2New[V] = nullptr;
         ToClone.push_back(I);
         append_range(WorkList, I->operands());
@@ -1772,6 +1852,12 @@ static void generateReproducer(Instruction *Cond, bool IsSigned, Module *M,
       Cloned->setDebugLoc({});
     }
   };
+
+  // Preserve q = udiv x, C for scaled quotient facts. Materializing the upper
+  // bound as an IR multiply and add would introduce integer wraparound.
+  for (const auto &Entry : Stack)
+    if (Entry.ImplicitFact)
+      CloneInstructions(Entry.ImplicitFact, /*IsSigned=*/false);
 
   // Materialize the assumptions for the reproducer using the entries in Stack.
   // That is, first clone the operands of the condition recursively until we
@@ -2078,12 +2164,27 @@ static bool checkOrAndOpImpliedByOther(
 void ConstraintInfo::addFact(CmpInst::Predicate Pred, Value *A, Value *B,
                              unsigned NumIn, unsigned NumOut,
                              SmallVectorImpl<StackEntry> &DFSInStack) {
+  // Keep the budget active through NE tightening, which calls decompose
+  // directly after getConstraint returns. Nested queries share this budget.
+  if (ConstraintQueryDepth++ == 0)
+    RemainingAddSignChecks = 64;
+  llvm::scope_exit QueryGuard([&] { --ConstraintQueryDepth; });
+
   addFactImpl(Pred, A, B, NumIn, NumOut, DFSInStack, false);
   // If the Pred is eq/ne, also add the fact to signed system.
   if (CmpInst::isEquality(Pred))
     addFactImpl(Pred, A, B, NumIn, NumOut, DFSInStack, true);
   if (Pred == CmpInst::ICMP_NE)
     tightenBoundUsingNe(A, B, NumIn, NumOut, DFSInStack);
+}
+
+void ConstraintInfo::addScaledFact(
+    CmpInst::Predicate Pred, Value *A, int64_t AScale, int64_t AOffset,
+    Value *B, unsigned NumIn, unsigned NumOut,
+    SmallVectorImpl<StackEntry> &DFSInStack) {
+  assert(AScale > 0 && "expected a positive scale");
+  addFactImpl(Pred, A, B, NumIn, NumOut, DFSInStack,
+              /*ForceSignedSystem=*/false, AScale, AOffset);
 }
 
 void ConstraintInfo::tightenBoundUsingNe(
@@ -2130,9 +2231,11 @@ void ConstraintInfo::tightenBoundUsingNe(
 void ConstraintInfo::addFactImpl(CmpInst::Predicate Pred, Value *A, Value *B,
                                  unsigned NumIn, unsigned NumOut,
                                  SmallVectorImpl<StackEntry> &DFSInStack,
-                                 bool ForceSignedSystem) {
+                                 bool ForceSignedSystem, int64_t AScale,
+                                 int64_t AOffset) {
   SmallVector<Value *> NewVariables;
-  auto R = getConstraint(Pred, A, B, NewVariables, ForceSignedSystem);
+  auto R = getConstraint(Pred, A, B, NewVariables, ForceSignedSystem, AScale,
+                         AOffset);
 
   // TODO: Support non-equality for facts as well.
   if (R.empty() || R.isNe())
@@ -2430,6 +2533,37 @@ static bool eliminateConstraints(Function &F, DominatorTree &DT, LoopInfo &LI,
       }
     };
 
+    auto AddScaledFact = [&](CmpPredicate Pred, Value *A, int64_t AScale,
+                             int64_t AOffset, Value *B) {
+      LLVM_DEBUG({
+        dbgs() << "Processing scaled fact to add to the system: " << AScale
+               << " * ";
+        A->printAsOperand(dbgs(), /*PrintType=*/true);
+        dbgs() << " + " << AOffset << " " << Pred << " ";
+        B->printAsOperand(dbgs(), /*PrintType=*/false);
+        dbgs() << "\n";
+      });
+      if (Info.getCS(CmpInst::isSigned(Pred)).size() > MaxRows) {
+        LLVM_DEBUG(
+            dbgs()
+            << "Skip adding constraint because system has too many rows.\n");
+        return;
+      }
+
+      Info.addScaledFact(Pred, A, AScale, AOffset, B, CB.NumIn, CB.NumOut,
+                         DFSInStack);
+      if (ReproducerModule && DFSInStack.size() > ReproducerCondStack.size()) {
+        // Keep both stacks in sync and preserve the instruction that implies
+        // this fact, even when its result is already a constraint variable.
+        for (unsigned I = 0,
+                      E = (DFSInStack.size() - ReproducerCondStack.size());
+             I < E; ++I)
+          ReproducerCondStack.emplace_back(ICmpInst::BAD_ICMP_PREDICATE,
+                                           nullptr, nullptr,
+                                           cast<Instruction>(A));
+      }
+    };
+
     if (!CB.isConditionFact()) {
       Value *X;
       if (match(CB.Inst, m_Intrinsic<Intrinsic::abs>(m_Value(X)))) {
@@ -2447,6 +2581,7 @@ static bool eliminateConstraints(Function &F, DominatorTree &DT, LoopInfo &LI,
         AddFact(Pred, MinMax, MinMax->getRHS());
         continue;
       }
+
       if (auto *USatI = dyn_cast<SaturatingInst>(CB.Inst)) {
         switch (USatI->getIntrinsicID()) {
         default:
@@ -2471,6 +2606,37 @@ static bool eliminateConstraints(Function &F, DominatorTree &DT, LoopInfo &LI,
           continue;
         }
         if (BO->getOpcode() == Instruction::UDiv) {
+          // For a positive constant divisor C and q = x /u C, record
+          // C*q <= x <= C*q + C - 1 using mathematical arithmetic. The lower
+          // product fits in the unsigned type, but the upper expression may
+          // not. Keep these expressions in the constraint system, not the IR.
+          if (auto *Divisor = dyn_cast<ConstantInt>(BO->getOperand(1));
+              Divisor && !Divisor->isZero() && !Divisor->isNegative() &&
+              canUseSExt(Divisor)) {
+            AddScaledFact(CmpInst::ICMP_ULE, BO,
+                          Divisor->getSExtValue(), 0, BO->getOperand(0));
+            AddScaledFact(CmpInst::ICMP_UGE, BO,
+                          Divisor->getSExtValue(),
+                          Divisor->getSExtValue() - 1, BO->getOperand(0));
+            // If the dividend is also known to be signed non-negative, the
+            // quotient and scaled product fit in the signed range as well.
+            // Mirror the exact relation into the signed system so it can
+            // discharge signed address and loop-bound queries.
+            if (Info.isKnownNonNegative(BO->getOperand(0))) {
+              AddFact(CmpInst::ICMP_SGE, BO,
+                      ConstantInt::get(BO->getType(), 0));
+              APInt MaxQuotient =
+                  APInt::getSignedMaxValue(BO->getType()->getIntegerBitWidth())
+                      .udiv(Divisor->getValue());
+              AddFact(CmpInst::ICMP_SLE, BO,
+                      ConstantInt::get(BO->getType(), MaxQuotient));
+              AddScaledFact(CmpInst::ICMP_SLE, BO,
+                            Divisor->getSExtValue(), 0, BO->getOperand(0));
+              AddScaledFact(CmpInst::ICMP_SGE, BO,
+                            Divisor->getSExtValue(),
+                            Divisor->getSExtValue() - 1, BO->getOperand(0));
+            }
+          }
           // udiv x, n: result <= x (quotient is at most the dividend)
           AddFact(CmpInst::ICMP_ULE, BO, BO->getOperand(0));
           continue;
