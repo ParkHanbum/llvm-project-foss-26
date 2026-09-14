@@ -12,6 +12,7 @@
 
 #include "InstCombineInternal.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/FloatingPointMode.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/AssumptionCache.h"
@@ -4556,6 +4557,83 @@ static Instruction *foldSelectAndOrPowerOfTwo(SelectInst &SI,
   return nullptr;
 }
 
+/// Match a floor-based implementation of round-to-nearest, ties-to-even:
+///   Floor = floor(X)
+///   Remainder = X - Floor
+///   NonTie = Remainder > 0.5 ? Floor + 1.0 : Floor
+///   Odd = Floor - 2.0 * floor(0.5 * Floor) == 1.0
+///   Tie = Odd ? Floor + 1.0 : Floor
+///   Result = Remainder == 0.5 ? Tie : NonTie
+///
+/// Require every intermediate to become dead when replacing the root select.
+static Value *matchRoundEvenEmulation(SelectInst &SI) {
+  Type *EltTy = SI.getType()->getScalarType();
+  if (!EltTy->isIEEELikeFPTy())
+    return nullptr;
+
+  Value *Remainder;
+  if (!match(SI.getCondition(),
+             m_SpecificFCmp(FCmpInst::FCMP_OEQ, m_Value(Remainder),
+                            m_SpecificFP(0.5))))
+    return nullptr;
+
+  // The zero-sign fixup must distinguish a zero input from a subnormal input.
+  // Also, a nonzero fadd operand may behave as -0.0 when inputs are flushed.
+  // Conservatively leave non-IEEE denormal modes unchanged.
+  if (SI.getFunction()->getDenormalMode(EltTy->getFltSemantics()) !=
+      DenormalMode::getIEEE())
+    return nullptr;
+
+  Value *X, *Floor;
+  if (!match(Remainder, m_FSub(m_Value(X), m_Value(Floor))) ||
+      !match(Floor, m_Intrinsic<Intrinsic::floor>(m_Specific(X))))
+    return nullptr;
+
+  Value *Tie = SI.getTrueValue();
+  Value *NonTie = SI.getFalseValue();
+  Value *FloorPlusOne, *GreaterCond;
+  if (!match(NonTie, m_Select(m_Value(GreaterCond), m_Value(FloorPlusOne),
+                              m_Specific(Floor))) ||
+      !match(GreaterCond,
+             m_SpecificFCmp(FCmpInst::FCMP_OGT, m_Specific(Remainder),
+                            m_SpecificFP(0.5))) ||
+      !match(FloorPlusOne, m_c_FAdd(m_Specific(Floor), m_SpecificFP(1.0))))
+    return nullptr;
+
+  Value *OddCond, *OddRemainder;
+  if (!match(Tie, m_Select(m_Value(OddCond), m_Specific(FloorPlusOne),
+                           m_Specific(Floor))) ||
+      !match(OddCond,
+             m_SpecificFCmp(FCmpInst::FCMP_OEQ, m_Value(OddRemainder),
+                            m_SpecificFP(1.0))))
+    return nullptr;
+
+  Value *TwiceHalfFloor, *HalfFloorRounded, *HalfFloor;
+  if (!match(OddRemainder,
+             m_FSub(m_Specific(Floor), m_Value(TwiceHalfFloor))) ||
+      !match(TwiceHalfFloor,
+             m_c_FMul(m_Value(HalfFloorRounded), m_SpecificFP(2.0))) ||
+      !match(HalfFloorRounded,
+             m_Intrinsic<Intrinsic::floor>(m_Value(HalfFloor))) ||
+      !match(HalfFloor,
+             m_c_FMul(m_Specific(Floor), m_SpecificFP(0.5))))
+    return nullptr;
+
+  auto HasNUses = [](Value *V, unsigned N) {
+    auto *I = dyn_cast<Instruction>(V);
+    return I && I->hasNUses(N);
+  };
+  if (!HasNUses(SI.getCondition(), 1) || !HasNUses(Tie, 1) ||
+      !HasNUses(NonTie, 1) || !HasNUses(GreaterCond, 1) ||
+      !HasNUses(OddCond, 1) || !HasNUses(OddRemainder, 1) ||
+      !HasNUses(TwiceHalfFloor, 1) || !HasNUses(HalfFloorRounded, 1) ||
+      !HasNUses(HalfFloor, 1) || !HasNUses(Remainder, 2) ||
+      !HasNUses(FloorPlusOne, 2) || !HasNUses(Floor, 6))
+    return nullptr;
+
+  return X;
+}
+
 // Return true if no use can observe the sign of zero of the select result,
 // looking through phis, selects and the loop back edge to the select itself.
 static bool isSelectZeroSignInsignificant(SelectInst &SI) {
@@ -4585,6 +4663,25 @@ static bool isSelectZeroSignInsignificant(SelectInst &SI) {
   return true;
 }
 
+// For -0.5 <= X < 0, the expansion returns +0.0 but roundeven returns -0.0.
+// Under IEEE denormal handling, an fadd cannot observe that difference if its
+// other operand cannot be -0.0.
+static bool canIgnoreRoundEvenZeroSign(SelectInst &SI, const SimplifyQuery &SQ) {
+  if (SI.hasNoSignedZeros() || isSelectZeroSignInsignificant(SI))
+    return true;
+
+  if (!SI.hasOneUse())
+    return false;
+
+  Use &U = *SI.use_begin();
+  auto *FAdd = dyn_cast<BinaryOperator>(U.getUser());
+  if (!FAdd || FAdd->getOpcode() != Instruction::FAdd)
+    return false;
+
+  Value *Other = FAdd->getOperand(1 - U.getOperandNo());
+  return cannotBeNegativeZero(Other, SQ.getWithInstruction(FAdd));
+}
+
 Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {
   Value *CondVal = SI.getCondition();
   Value *TrueVal = SI.getTrueValue();
@@ -4594,6 +4691,26 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {
   FastMathFlags FMF;
   if (auto *FPMO = dyn_cast_if_present<FPMathOperator>(&SI))
     FMF = FPMO->getFastMathFlags();
+
+  if (Value *X = matchRoundEvenEmulation(SI)) {
+    bool IgnoreZeroSign = canIgnoreRoundEvenZeroSign(SI, SQ);
+    // The fixup compares X and may return X itself. Keep those uses consistent
+    // if X can be undef; otherwise it could return a nonzero, unrounded value.
+    if (!IgnoreZeroSign && !isGuaranteedNotToBeUndef(X, &AC, &SI, &DT))
+      X = Builder.CreateFreeze(X);
+
+    Value *Rounded = Builder.CreateUnaryIntrinsic(Intrinsic::roundeven, X, &SI);
+    if (IgnoreZeroSign)
+      return replaceInstUsesWith(SI, Rounded);
+
+    // Adding +0.0 changes a rounded -0.0 to +0.0. Preserve the original sign
+    // when the input itself is zero, including X == -0.0.
+    Constant *Zero = Constant::getNullValue(SI.getType());
+    Value *PositiveZeroFixed = Builder.CreateFAdd(Rounded, Zero);
+    Value *InputIsZero = Builder.CreateFCmpOEQ(X, Zero);
+    Value *Result = Builder.CreateSelect(InputIsZero, X, PositiveZeroFixed);
+    return replaceInstUsesWith(SI, Result);
+  }
 
   if (Value *V = simplifySelectInst(CondVal, TrueVal, FalseVal, FMF,
                                     SQ.getWithInstruction(&SI)))
