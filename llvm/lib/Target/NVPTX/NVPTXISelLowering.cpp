@@ -886,6 +886,7 @@ NVPTXTargetLowering::NVPTXTargetLowering(const NVPTXTargetMachine &TM,
   // We have some custom DAG combine patterns for these nodes
   setTargetDAGCombine({ISD::ADD,
                        ISD::AND,
+                       ISD::FDIV,
                        ISD::EXTRACT_VECTOR_ELT,
                        ISD::FADD,
                        ISD::FMAXNUM,
@@ -7339,6 +7340,50 @@ static SDValue combineProxyReg(SDNode *N,
   return SDValue();
 }
 
+// For half x and 1 < C < 2, rounding a float reciprocal product back to
+// half gives the correctly rounded half quotient. This avoids promoting the
+// half division to a float division. Do not remove the final half rounding.
+//
+// Write C = d*2^k, with odd d <= 2047. Near a half rounding midpoint h,
+// x/C differs from h by at least one unit of the midpoint's scale divided
+// by d (the scaled numerator is even and the midpoint numerator is odd).
+// The relative separation is greater than 1/(4097*2047). The two float
+// roundings have relative error at most 2^-23 + 2^-48, which is smaller.
+// The interval on C ensures normal float intermediates and no half overflow;
+// it also covers the subnormal half midpoints without an exact tie.
+static SDValue combineF16ConstantDiv(SDNode *N, SelectionDAG &DAG) {
+  if (N->getValueType(0) != MVT::f16 || N->getFlags().hasAllowReciprocal())
+    return SDValue();
+  const MachineFunction &MF = DAG.getMachineFunction();
+  if (MF.getFunction().hasFnAttribute(Attribute::StrictFP) ||
+      MF.getDenormalMode(APFloat::IEEEhalf()) != DenormalMode::getIEEE() ||
+      MF.getDenormalMode(APFloat::IEEEsingle()) != DenormalMode::getIEEE())
+    return SDValue();
+
+  auto *C = dyn_cast<ConstantFPSDNode>(N->getOperand(1));
+  if (!C)
+    return SDValue();
+  const APFloat &Divisor = C->getValueAPF();
+  uint64_t Bits = Divisor.bitcastToAPInt().getZExtValue();
+  // Positive normal binary16 values strictly between one and two. Existing
+  // simplifications handle one and exact power-of-two reciprocals.
+  if (Bits <= 0x3c00 || Bits >= 0x4000)
+    return SDValue();
+
+  APFloat WideDivisor = Divisor;
+  bool LosesInfo;
+  WideDivisor.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven,
+                      &LosesInfo);
+  APFloat Recip = APFloat::getOne(APFloat::IEEEsingle());
+  Recip.divide(WideDivisor, APFloat::rmNearestTiesToEven);
+  SDLoc DL(N);
+  SDValue X = DAG.getNode(ISD::FP_EXTEND, DL, MVT::f32, N->getOperand(0));
+  SDValue Product = DAG.getNode(ISD::FMUL, DL, MVT::f32, X,
+                                DAG.getConstantFP(Recip, DL, MVT::f32));
+  return DAG.getNode(ISD::FP_ROUND, DL, MVT::f16, Product,
+                     DAG.getIntPtrConstant(0, DL, /*isTarget=*/true));
+}
+
 SDValue NVPTXTargetLowering::PerformDAGCombine(SDNode *N,
                                                DAGCombinerInfo &DCI) const {
   CodeGenOptLevel OptLevel = getTargetMachine().getOptLevel();
@@ -7347,6 +7392,8 @@ SDValue NVPTXTargetLowering::PerformDAGCombine(SDNode *N,
     break;
   case ISD::ADD:
     return PerformADDCombine(N, DCI, OptLevel);
+  case ISD::FDIV:
+    return combineF16ConstantDiv(N, DCI.DAG);
   case ISD::ADDRSPACECAST:
     return combineADDRSPACECAST(N, DCI);
   case ISD::SIGN_EXTEND:
