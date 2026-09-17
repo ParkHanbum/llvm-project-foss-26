@@ -18,6 +18,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -423,8 +424,128 @@ handleSpaceCheckIntrinsics(InstCombiner &IC, IntrinsicInst &II) {
   }
 }
 
+// Return the next non-debug intrinsic instruction in the same basic block.
+// Debug records are not Instructions; this helper only needs to skip legacy
+// dbg intrinsics that may still appear in the instruction list.
+static Instruction *getNextNonDbgInstruction(Instruction *I) {
+  BasicBlock *BB = I->getParent();
+  auto It = I->getIterator();
+  ++It;
+  if (It == BB->end())
+    return nullptr;
+  It = skipDebugIntrinsics(It);
+  return It == BB->end() ? nullptr : &*It;
+}
+
+// Match only the canonical full-width, full-membermask i32 butterfly sum.
+// Keep the replacement collective at the last shuffle, never at a possibly
+// divergent consumer.
+static std::optional<Instruction *>
+combineFullWarpButterflyAdd(InstCombiner &IC, IntrinsicInst &II) {
+  using namespace PatternMatch;
+
+  auto IsShuffle = [](IntrinsicInst *I, unsigned Offset) {
+    return I && I->getIntrinsicID() == Intrinsic::nvvm_shfl_sync_bfly_i32 &&
+           !I->hasOperandBundles() && !I->isMustTailCall() &&
+           match(I->getArgOperand(0), m_AllOnes()) &&
+           match(I->getArgOperand(2), m_SpecificInt(Offset)) &&
+           match(I->getArgOperand(3), m_SpecificInt(31));
+  };
+
+  if (!IsShuffle(&II, 16) || !II.hasOneUse())
+    return std::nullopt;
+
+  auto *FinalAdd = dyn_cast<BinaryOperator>(*II.user_begin());
+  if (!FinalAdd)
+    return std::nullopt;
+
+  if (FinalAdd->getParent() != II.getParent()) {
+    auto *Br = dyn_cast<CondBrInst>(II.getParent()->getTerminator());
+    if (!Br || getNextNonDbgInstruction(&II) != Br ||
+        FinalAdd->getParent()->getSinglePredecessor() != II.getParent())
+      return std::nullopt;
+
+    auto It = FinalAdd->getParent()->getFirstNonPHIOrDbg();
+    if (It == FinalAdd->getParent()->end() || &*It != FinalAdd)
+      return std::nullopt;
+  } else if (getNextNonDbgInstruction(&II) != FinalAdd) {
+    return std::nullopt;
+  }
+
+  IntrinsicInst *Shuffle = &II;
+  BinaryOperator *Add = FinalAdd;
+  Value *Input = nullptr;
+  SmallVector<Instruction *, 10> Dead;
+
+  for (unsigned Offset = 16; Offset; Offset >>= 1) {
+    if (!IsShuffle(Shuffle, Offset) || !Shuffle->hasOneUse() ||
+        Shuffle->getParent() != II.getParent() ||
+        Add->getOpcode() != Instruction::Add || Add->hasNoSignedWrap() ||
+        Add->hasNoUnsignedWrap())
+      return std::nullopt;
+
+    Input = Shuffle->getArgOperand(1);
+    if (!((Add->getOperand(0) == Input && Add->getOperand(1) == Shuffle) ||
+          (Add->getOperand(1) == Input && Add->getOperand(0) == Shuffle)))
+      return std::nullopt;
+
+    if (Add != FinalAdd &&
+        (Add->getParent() != II.getParent() || !Add->hasNUses(2) ||
+         getNextNonDbgInstruction(Shuffle) != Add))
+      return std::nullopt;
+
+    Dead.push_back(Add);
+    Dead.push_back(Shuffle);
+
+    if (Offset == 1)
+      break;
+
+    Add = dyn_cast<BinaryOperator>(Input);
+    if (!Add || getNextNonDbgInstruction(Add) != Shuffle)
+      return std::nullopt;
+
+    auto *A = dyn_cast<IntrinsicInst>(Add->getOperand(0));
+    auto *B = dyn_cast<IntrinsicInst>(Add->getOperand(1));
+    Shuffle = IsShuffle(A, Offset >> 1) ? A : B;
+  }
+
+  // All five collectives have the same full membermask and no intervening
+  // control flow or side effects. Their existing sync contract requires all
+  // named non-exited lanes to participate. With all 32 source lanes available,
+  // the butterfly computes exactly the sum modulo 2^32.
+  Value *Redux;
+  {
+    // The guard must die before II is erased below. Otherwise restoring the
+    // saved insertion point would refer to an erased instruction.
+    IRBuilderBase::InsertPointGuard Guard(IC.Builder);
+    IC.Builder.SetInsertPoint(&II);
+    Redux = IC.Builder.CreateIntrinsic(
+        Intrinsic::nvvm_redux_sync_add, {},
+        {Input, ConstantInt::getSigned(II.getType(), -1)});
+    cast<Instruction>(Redux)->setDebugLoc(FinalAdd->getDebugLoc()
+                                              ? FinalAdd->getDebugLoc()
+                                              : II.getDebugLoc());
+  }
+
+  IC.replaceInstUsesWith(*FinalAdd, Redux);
+
+  // Shuffles are collective operations, not ordinary trivially-dead calls.
+  // Remove the entire matched sequence explicitly, in reverse use order.
+  for (Instruction *I : Dead)
+    IC.eraseInstFromFunction(*I);
+
+  // Engaged optional with nullptr means target-specific processing is
+  // complete and the triggering intrinsic was erased.
+  return nullptr;
+}
+
 std::optional<Instruction *>
 NVPTXTTIImpl::instCombineIntrinsic(InstCombiner &IC, IntrinsicInst &II) const {
+  if (ST->getSmVersion() >= 80 && ST->getPTXVersion() >= 70 &&
+      II.getIntrinsicID() == Intrinsic::nvvm_shfl_sync_bfly_i32) {
+    if (auto Result = combineFullWarpButterflyAdd(IC, II))
+      return *Result;
+  }
   if (std::optional<Instruction *> I = handleSpaceCheckIntrinsics(IC, II))
     return *I;
   if (Instruction *I = convertNvvmIntrinsicToLlvm(IC, &II))
