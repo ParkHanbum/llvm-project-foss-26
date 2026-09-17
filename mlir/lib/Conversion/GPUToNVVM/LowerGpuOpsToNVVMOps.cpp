@@ -21,6 +21,7 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MathToNVVM/MathToNVVM.h"
 #include "mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -29,7 +30,9 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -38,6 +41,7 @@
 #include "../GPUCommon/GPUOpsLowering.h"
 #include "../GPUCommon/IndexIntrinsicsOpLowering.h"
 #include "../GPUCommon/OpToFuncCallLowering.h"
+#include <limits>
 #include <optional>
 
 namespace mlir {
@@ -101,6 +105,185 @@ static constexpr llvm::StringLiteral kNVVMNamedBarrierIdPrefix =
 static constexpr int32_t kNVVMFirstNamedBarrierId = 1;
 static constexpr int32_t kNVVMLastNamedBarrierId = 15;
 static constexpr int32_t kNVVMWarpSize = 32;
+
+// Only unwrap lossless, statically single-element packing. No arbitrary
+// extract, vector shuffle, bitcast, or multi-element vector is accepted.
+static bool isSingletonVector(Type type) {
+  auto vector = dyn_cast<VectorType>(type);
+  return vector && !vector.isScalable() && vector.getRank() == 1 &&
+         vector.getNumElements() == 1;
+}
+
+static bool isArgMaxConstant(Value value, int64_t expected) {
+  Attribute attr;
+  if (!matchPattern(value, m_Constant(&attr)))
+    return false;
+  if (auto integer = dyn_cast<IntegerAttr>(attr))
+    return integer.getValue().getSExtValue() == expected;
+  if (auto dense = dyn_cast<DenseIntElementsAttr>(attr))
+    return isSingletonVector(value.getType()) && dense.isSplat() &&
+           dense.getSplatValue<APInt>().getSExtValue() == expected;
+  return false;
+}
+
+static Value stripArgMaxSingleton(Value value) {
+  for (unsigned i = 0; i != 8; ++i) {
+    Operation *def = value.getDefiningOp();
+    if (!def)
+      break;
+    if (auto extract = dyn_cast<vector::ExtractOp>(def)) {
+      auto position = extract.getStaticPosition();
+      if (isSingletonVector(extract.getSource().getType()) &&
+          position.size() == 1 && position[0] == 0) {
+        value = extract.getSource();
+        continue;
+      }
+    }
+    if (isa<LLVM::ExtractElementOp>(def) &&
+        isSingletonVector(def->getOperand(0).getType()) &&
+        isArgMaxConstant(def->getOperand(1), 0)) {
+      value = def->getOperand(0);
+      continue;
+    }
+    if (isa<vector::BroadcastOp>(def) && isSingletonVector(value.getType())) {
+      value = def->getOperand(0);
+      continue;
+    }
+    if (isa<LLVM::InsertElementOp>(def) && isSingletonVector(value.getType()) &&
+        isArgMaxConstant(def->getOperand(2), 0)) {
+      value = def->getOperand(1);
+      continue;
+    }
+    break;
+  }
+  return value;
+}
+
+static bool isArgMaxLane(Value value) {
+  value = stripArgMaxSingleton(value);
+  if (!value.getType().isInteger(32))
+    return false;
+  Operation *cast = value.getDefiningOp();
+  if (!cast || !isa<arith::IndexCastOp, arith::IndexCastUIOp>(cast))
+    return false;
+  Value index = cast->getOperand(0);
+  if (index.getDefiningOp<gpu::LaneIdOp>())
+    return true;
+  auto tid = index.getDefiningOp<gpu::ThreadIdOp>();
+  if (!tid || tid.getDimension() != gpu::Dimension::x)
+    return false;
+  auto func = tid->getParentOfType<gpu::GPUFuncOp>();
+  auto sizes = func ? func.getKnownBlockSizeAttr() : DenseI32ArrayAttr();
+  return sizes && sizes.asArrayRef()[0] == kNVVMWarpSize;
+}
+
+// Prove candidate is lane for x != INT_MIN and either lane or zero for
+// x == INT_MIN. Bounded recursion also accepts redundant nested sentinels.
+static bool isArgMaxCandidate(Value value, Value input, unsigned depth = 0) {
+  if (depth == 8)
+    return false;
+  value = stripArgMaxSingleton(value);
+  if (isArgMaxLane(value))
+    return true;
+  auto select = value.getDefiningOp<arith::SelectOp>();
+  if (!select)
+    return false;
+  auto cmp = stripArgMaxSingleton(select.getCondition())
+                 .getDefiningOp<arith::CmpIOp>();
+  if (!cmp)
+    return false;
+  Value lhs = stripArgMaxSingleton(cmp.getLhs());
+  Value rhs = stripArgMaxSingleton(cmp.getRhs());
+  auto pred = cmp.getPredicate();
+  if (lhs != stripArgMaxSingleton(input)) {
+    std::swap(lhs, rhs);
+    if (pred == arith::CmpIPredicate::slt)
+      pred = arith::CmpIPredicate::sgt;
+    else if (pred != arith::CmpIPredicate::eq &&
+             pred != arith::CmpIPredicate::ne)
+      return false;
+  }
+  if (lhs != stripArgMaxSingleton(input) ||
+      !isArgMaxConstant(rhs, std::numeric_limits<int32_t>::min()))
+    return false;
+  bool trueWhenNonMin = pred == arith::CmpIPredicate::sgt ||
+                        pred == arith::CmpIPredicate::ne;
+  if (!trueWhenNonMin && pred != arith::CmpIPredicate::eq)
+    return false;
+  Value nonMin = trueWhenNonMin ? select.getTrueValue() : select.getFalseValue();
+  Value atMin = trueWhenNonMin ? select.getFalseValue() : select.getTrueValue();
+  return isArgMaxConstant(stripArgMaxSingleton(atMin), 0) &&
+         isArgMaxCandidate(nonMin, input, depth + 1);
+}
+
+static bool isArgMaxFullWarpMax(Value value, Value input, Block *block) {
+  if (auto reduce = value.getDefiningOp<gpu::SubgroupReduceOp>())
+    return reduce->getBlock() == block && reduce.getValue() == input &&
+           reduce.getOp() == gpu::AllReduceOperation::MAXSI &&
+           reduce.getUniform() && !reduce.getClusterSize();
+  // Accept exactly the complete 1,2,4,8,16 butterfly, not a partial or
+  // disconnected tree. Keeping collectives in one block avoids matching
+  // unrelated dynamic collective instances across control flow.
+  for (int offset = kNVVMWarpSize / 2; offset != 0; offset /= 2) {
+    auto max = value.getDefiningOp<arith::MaxSIOp>();
+    if (!max || max->getBlock() != block)
+      return false;
+    Value next;
+    for (unsigned side = 0; side != 2; ++side) {
+      Value other = max->getOperand(1 - side);
+      auto shuffle = max->getOperand(side).getDefiningOp<gpu::ShuffleOp>();
+      if (shuffle && shuffle->getBlock() == block &&
+          shuffle.getMode() == gpu::ShuffleMode::XOR &&
+          shuffle.getValue() == other &&
+          isArgMaxConstant(shuffle.getOffset(), offset) &&
+          isArgMaxConstant(shuffle.getWidth(), kNVVMWarpSize)) {
+        next = other;
+        break;
+      }
+    }
+    if (!next)
+      return false;
+    value = next;
+  }
+  return value == input;
+}
+
+struct FoldArgMaxIndexShuffle final : OpRewritePattern<gpu::ShuffleOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(gpu::ShuffleOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getMode() != gpu::ShuffleMode::IDX ||
+        !op.getValue().getType().isInteger(32) ||
+        !isArgMaxConstant(op.getWidth(), kNVVMWarpSize) ||
+        !op->getResult(1).use_empty())
+      return failure();
+    auto cttz = op.getOffset().getDefiningOp<math::CountTrailingZerosOp>();
+    if (!cttz || !cttz.getType().isInteger(32) || cttz->getBlock() != op->getBlock())
+      return failure();
+    auto ballot = cttz.getOperand().getDefiningOp<gpu::BallotOp>();
+    if (!ballot || !ballot.getType().isInteger(32) ||
+        ballot->getBlock() != op->getBlock())
+      return failure();
+    auto cmp = ballot.getPredicate().getDefiningOp<arith::CmpIOp>();
+    if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::eq ||
+        cmp->getBlock() != op->getBlock())
+      return failure();
+    for (unsigned side = 0; side != 2; ++side) {
+      Value input = cmp->getOperand(side);
+      if (!input.getType().isInteger(32) ||
+          !isArgMaxFullWarpMax(cmp->getOperand(1 - side), input, op->getBlock()) ||
+          !isArgMaxCandidate(op.getValue(), input))
+        continue;
+      // Defined width-32 shuffles require all 32 lanes active. At least one
+      // max lane exists. For non-sentinel maxima its candidate is its lane;
+      // for the all-INT_MIN case ballot is all ones and lane zero returns zero.
+      rewriter.replaceAllUsesWith(op.getShuffleResult(), op.getOffset());
+      rewriter.eraseOp(op);
+      return success();
+    }
+    return failure();
+  }
+};
 
 static FailureOr<StringAttr>
 createNVVMNamedBarrierIdGlobal(gpu::InitializeNamedBarrierOp op,
@@ -209,7 +392,8 @@ struct GPUShuffleOpLowering : public ConvertOpToLLVMPattern<gpu::ShuffleOp> {
 
     Value one = LLVM::ConstantOp::create(rewriter, loc, int32Type, 1);
     Value minusOne = LLVM::ConstantOp::create(rewriter, loc, int32Type, -1);
-    Value thirtyTwo = LLVM::ConstantOp::create(rewriter, loc, int32Type, 32);
+    Value thirtyTwo =
+        LLVM::ConstantOp::create(rewriter, loc, int32Type, kNVVMWarpSize);
     Value numLeadInactiveLane = LLVM::SubOp::create(
         rewriter, loc, int32Type, thirtyTwo, adaptor.getWidth());
     // Bit mask of active lanes: `(-1) >> (32 - activeWidth)`.
@@ -530,6 +714,7 @@ struct LowerGpuOpsToNVVMOpsPass final
     // single conversion pass.
     {
       RewritePatternSet patterns(m.getContext());
+      patterns.add<FoldArgMaxIndexShuffle>(m.getContext());
       populateGpuRewritePatterns(patterns);
       // Transform N-D vector.from_elements to 1-D vector.from_elements before
       // conversion.
