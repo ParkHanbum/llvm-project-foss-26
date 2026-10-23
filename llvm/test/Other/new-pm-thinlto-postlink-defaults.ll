@@ -207,6 +207,7 @@
 ; CHECK-POSTLINK-O-NEXT: Running pass: SimplifyCFGPass
 ; CHECK-POSTLINK-O-NEXT: Running pass: AllocTokenPass
 ; CHECK-POST-EP-OPT-LAST-NEXT: Running pass: NoOpModulePass
+; CHECK-O3-NEXT: Running pass: FiniteValuePropagationPass
 ; CHECK-POSTLINK-O-NEXT: Running pass: GlobalDCEPass
 ; CHECK-POSTLINK-O-NEXT: Running pass: ConstantMergePass
 ; CHECK-POSTLINK-O-NEXT: Running pass: CGProfilePass

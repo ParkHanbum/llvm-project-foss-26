@@ -194,6 +194,7 @@
 ; CHECK-O-NEXT: Running pass: TailCallElimPass
 ; CHECK-O-NEXT: Running pass: SimplifyCFGPass
 ; CHECK-O-NEXT: Running pass: AllocTokenPass
+; CHECK-O3-NEXT: Running pass: FiniteValuePropagationPass
 ; CHECK-O-NEXT: Running pass: GlobalDCEPass
 ; CHECK-O-NEXT: Running pass: ConstantMergePass
 ; CHECK-O-NEXT: Running pass: CGProfilePass

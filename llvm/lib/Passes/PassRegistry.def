@@ -81,6 +81,7 @@ MODULE_PASS("dfsan", DataFlowSanitizerPass())
 MODULE_PASS("dot-callgraph", CallGraphDOTPrinterPass())
 MODULE_PASS("dxil-upgrade", DXILUpgradePass())
 MODULE_PASS("elim-avail-extern", EliminateAvailableExternallyPass())
+MODULE_PASS("finite-value-propagation", FiniteValuePropagationPass())
 MODULE_PASS("extract-blocks", BlockExtractorPass({}, false))
 MODULE_PASS("expand-variadics",
             ExpandVariadicsPass(ExpandVariadicsMode::Disable))

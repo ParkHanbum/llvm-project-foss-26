@@ -56,6 +56,7 @@
 #include "llvm/Transforms/IPO/EmbedBitcodePass.h"
 #include "llvm/Transforms/IPO/ExpandVariadics.h"
 #include "llvm/Transforms/IPO/FatLTOCleanup.h"
+#include "llvm/Transforms/IPO/FiniteValuePropagation.h"
 #include "llvm/Transforms/IPO/ForceFunctionAttrs.h"
 #include "llvm/Transforms/IPO/FunctionAttrs.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
@@ -1596,6 +1597,8 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
   // FIXME: It would seem like these should come first in the optimization
   // pipeline and maybe be the bottom of the canonicalization pipeline? Weird
   // ordering here.
+  if (Level == OptimizationLevel::O3 && Opts.enable_finite_value_propagation)
+    MPM.addPass(FiniteValuePropagationPass());
   MPM.addPass(GlobalDCEPass());
   MPM.addPass(ConstantMergePass());
 

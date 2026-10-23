@@ -41,6 +41,8 @@ defm : BoolField<"enable-devirtualize-speculatively", "false",
   "Enable speculative devirtualization optimization">;
 defm : BoolField<"enable-dfa-jump-thread", "true",
   "Enable DFA jump threading">;
+defm : BoolField<"enable-finite-value-propagation", "true",
+  "Enable folding computations over small proven input sets at O3">;
 defm : BoolField<"enable-global-analyses", "true",
   "Enable inter-procedural analyses">;
 defm : BoolField<"enable-gvn-hoist", "false",

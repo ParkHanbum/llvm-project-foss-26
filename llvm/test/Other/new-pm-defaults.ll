@@ -273,6 +273,7 @@
 ; CHECK-DEFAULT-NEXT: Running pass: AllocToken
 ; CHECK-EP-OPTIMIZER-LAST: Running pass: NoOpModulePass
 ; CHECK-HOT-COLD-SPLIT-NEXT: Running pass: HotColdSplittingPass
+; CHECK-O3-NEXT: Running pass: FiniteValuePropagationPass
 ; CHECK-O-NEXT: Running pass: GlobalDCEPass
 ; CHECK-O-NEXT: Running pass: ConstantMergePass
 ; CHECK-MERGE-FUNCS-NEXT: Running pass: MergeFunctionsPass
