@@ -21,6 +21,7 @@
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/GlobalsModRef.h"
+#include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -1404,7 +1405,8 @@ struct LoadOps {
   LoadInst *RootInsert = nullptr;
   bool FoundRoot = false;
   uint64_t LoadSize = 0;
-  uint64_t Shift = 0;
+  Value *Shift = nullptr;
+  Value *Accumulator = nullptr;
   Type *ZextType;
   AAMDNodes AATags;
 };
@@ -1414,7 +1416,7 @@ struct LoadOps {
 // (ZExt(L1) << shift1) | ZExt(L2) -> ZExt(L3)
 static bool foldLoadsRecursive(Value *V, LoadOps &LOps, const DataLayout &DL,
                                AliasAnalysis &AA, bool IsRoot = false) {
-  uint64_t ShAmt2;
+  Value *ShAmt2 = nullptr;
   Value *X;
   Instruction *L1, *L2;
 
@@ -1424,10 +1426,13 @@ static bool foldLoadsRecursive(Value *V, LoadOps &LOps, const DataLayout &DL,
   if (!IsRoot && !V->hasOneUse())
     return false;
 
-  if (!match(V, m_c_Or(m_Value(X),
-                       m_OneUse(m_ShlOrSelf(m_OneUse(m_ZExt(m_Instruction(L2))),
-                                            ShAmt2)))))
+  auto MatchLoad2 =
+      m_CombineOr(m_Shl(m_OneUse(m_ZExt(m_Instruction(L2))), m_Value(ShAmt2)),
+                  m_ZExt(m_Instruction(L2)));
+  if (!match(V, m_c_Or(m_Value(X), m_OneUse(MatchLoad2))))
     return false;
+  if (!ShAmt2)
+    ShAmt2 = ConstantInt::get(V->getType(), 0);
 
   if (!foldLoadsRecursive(X, LOps, DL, AA, /*IsRoot=*/false) && LOps.FoundRoot)
     // Avoid Partial chain merge.
@@ -1435,11 +1440,27 @@ static bool foldLoadsRecursive(Value *V, LoadOps &LOps, const DataLayout &DL,
 
   // Check if the pattern has loads
   LoadInst *LI1 = LOps.Root;
-  uint64_t ShAmt1 = LOps.Shift;
-  if (LOps.FoundRoot == false &&
-      match(X, m_OneUse(
-                   m_ShlOrSelf(m_OneUse(m_ZExt(m_Instruction(L1))), ShAmt1)))) {
+  Value *ShAmt1 = LOps.Shift;
+  if (!LOps.FoundRoot) {
+    auto MatchLoad1 =
+        m_CombineOr(m_Shl(m_OneUse(m_ZExt(m_Instruction(L1))), m_Value(ShAmt1)),
+                    m_ZExt(m_Instruction(L1)));
+    if (!match(X, m_OneUse(MatchLoad1))) {
+      // An unrolled byte decoder may start the OR chain with an accumulator:
+      // (Acc | (ZExt(L1) << S)) | (ZExt(L2) << (S + 8)). Keep Acc outside
+      // the combined load and require single use of the intermediate OR.
+      if (!match(X, m_OneUse(m_c_Or(m_OneUse(MatchLoad1),
+                                   m_Value(LOps.Accumulator)))))
+        return false;
+      // Preserve existing constant-shift load assembly. Treating an inner
+      // OR tree as an accumulator can merge only part of a wider load and
+      // prevent subsequent InstCombine passes from recognizing the whole.
+      if (!ShAmt1 || isa<Constant>(ShAmt1) || isa<Constant>(ShAmt2))
+        return false;
+    }
     LI1 = dyn_cast<LoadInst>(L1);
+    if (!ShAmt1)
+      ShAmt1 = ConstantInt::get(X->getType(), 0);
   }
   LoadInst *LI2 = dyn_cast<LoadInst>(L2);
 
@@ -1536,7 +1557,16 @@ static bool foldLoadsRecursive(Value *V, LoadOps &LOps, const DataLayout &DL,
   uint64_t ShiftDiff = IsBigEndian ? LoadSize2 : LoadSize1;
   uint64_t PrevSize =
       DL.getTypeStoreSize(IntegerType::get(LI1->getContext(), LoadSize1));
-  if ((ShAmt2 - ShAmt1) != ShiftDiff || (Offset2 - Offset1) != PrevSize)
+  if ((Offset2 - Offset1) != PrevSize)
+    return false;
+
+  // The shifts may share a variable base, as in S and S + LoadSize1.
+  // Subtraction is wrapping: whenever both original shifts are in range,
+  // their constant difference gives the relative bit positions of the loads.
+  Value *Diff = simplifyBinOp(Instruction::Sub, ShAmt2, ShAmt1,
+                              SimplifyQuery(DL).getWithoutUndef());
+  auto *ConstDiff = dyn_cast_or_null<ConstantInt>(Diff);
+  if (!ConstDiff || ConstDiff->getValue() != ShiftDiff)
     return false;
 
   // Reject if the combined size of the loads exceeds the target type size.
@@ -1616,10 +1646,17 @@ static bool foldConsecutiveLoads(Instruction &I, const DataLayout &DL,
   // Zero extend if needed.
   NewOp = Builder.CreateZExt(NewOp, LOps.ZextType);
 
-  // Check if shift needed. We need to shift with the amount of load1
-  // shift if not zero.
-  if (LOps.Shift)
+  // A variable shift amount may be computed after the loads. Emit such a
+  // shift at the original OR so that its operands dominate it.
+  if (!isa<Constant>(LOps.Shift))
+    Builder.SetInsertPoint(&I);
+  if (!match(LOps.Shift, m_Zero()))
     NewOp = Builder.CreateShl(NewOp, LOps.Shift);
+  if (LOps.Accumulator) {
+    // Acc may be defined after the loads even when the shift is constant.
+    Builder.SetInsertPoint(&I);
+    NewOp = Builder.CreateOr(NewOp, LOps.Accumulator);
+  }
   I.replaceAllUsesWith(NewOp);
 
   return true;
