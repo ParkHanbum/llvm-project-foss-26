@@ -6,20 +6,33 @@
 ; PR140234: Expose the consecutive pairs before load shrinking.
 
 define <4 x double> @interleave_loads(ptr %px, ptr %py) {
-; CHECK-LABEL: define <4 x double> @interleave_loads(
-; CHECK-SAME: ptr [[PX:%.*]], ptr [[PY:%.*]]) #[[ATTR0:[0-9]+]] {
-; CHECK-NEXT:    [[PXHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PX]], i64 16
-; CHECK-NEXT:    [[PYHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PY]], i64 16
-; CHECK-NEXT:    [[X0:%.*]] = load <2 x double>, ptr [[PX]], align 16
-; CHECK-NEXT:    [[Y0:%.*]] = load <2 x double>, ptr [[PY]], align 16
-; CHECK-NEXT:    [[X1:%.*]] = load <2 x double>, ptr [[PXHI]], align 16
-; CHECK-NEXT:    [[TMP1:%.*]] = load <1 x double>, ptr [[PYHI]], align 16
-; CHECK-NEXT:    [[SHUF0:%.*]] = shufflevector <2 x double> [[X0]], <2 x double> [[Y0]], <4 x i32> <i32 1, i32 2, i32 poison, i32 poison>
-; CHECK-NEXT:    [[SHUF1:%.*]] = shufflevector <2 x double> [[X1]], <2 x double> poison, <4 x i32> <i32 poison, i32 1, i32 poison, i32 poison>
-; CHECK-NEXT:    [[SHUF2:%.*]] = shufflevector <4 x double> [[SHUF0]], <4 x double> [[SHUF1]], <4 x i32> <i32 0, i32 1, i32 5, i32 poison>
-; CHECK-NEXT:    [[SHUF3:%.*]] = shufflevector <1 x double> [[TMP1]], <1 x double> poison, <4 x i32> <i32 0, i32 poison, i32 poison, i32 poison>
-; CHECK-NEXT:    [[SHUF4:%.*]] = shufflevector <4 x double> [[SHUF2]], <4 x double> [[SHUF3]], <4 x i32> <i32 0, i32 1, i32 2, i32 4>
-; CHECK-NEXT:    ret <4 x double> [[SHUF4]]
+; AVX-LABEL: define <4 x double> @interleave_loads(
+; AVX-SAME: ptr [[PX:%.*]], ptr [[PY:%.*]]) #[[ATTR0:[0-9]+]] {
+; AVX-NEXT:    [[PXHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PX]], i64 16
+; AVX-NEXT:    [[PYHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PY]], i64 16
+; AVX-NEXT:    [[X0:%.*]] = load <2 x double>, ptr [[PX]], align 16
+; AVX-NEXT:    [[Y0:%.*]] = load <2 x double>, ptr [[PY]], align 16
+; AVX-NEXT:    [[X1:%.*]] = load <2 x double>, ptr [[PXHI]], align 16
+; AVX-NEXT:    [[Y1:%.*]] = load <2 x double>, ptr [[PYHI]], align 16
+; AVX-NEXT:    [[TMP1:%.*]] = shufflevector <2 x double> [[X0]], <2 x double> [[X1]], <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+; AVX-NEXT:    [[TMP2:%.*]] = shufflevector <2 x double> [[Y0]], <2 x double> [[Y1]], <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+; AVX-NEXT:    [[SHUF4:%.*]] = shufflevector <4 x double> [[TMP1]], <4 x double> [[TMP2]], <4 x i32> <i32 1, i32 4, i32 3, i32 6>
+; AVX-NEXT:    ret <4 x double> [[SHUF4]]
+;
+; SSE-LABEL: define <4 x double> @interleave_loads(
+; SSE-SAME: ptr [[PX:%.*]], ptr [[PY:%.*]]) #[[ATTR0:[0-9]+]] {
+; SSE-NEXT:    [[PXHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PX]], i64 16
+; SSE-NEXT:    [[PYHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PY]], i64 16
+; SSE-NEXT:    [[X0:%.*]] = load <2 x double>, ptr [[PX]], align 16
+; SSE-NEXT:    [[Y0:%.*]] = load <2 x double>, ptr [[PY]], align 16
+; SSE-NEXT:    [[X1:%.*]] = load <2 x double>, ptr [[PXHI]], align 16
+; SSE-NEXT:    [[TMP1:%.*]] = load <1 x double>, ptr [[PYHI]], align 16
+; SSE-NEXT:    [[SHUF0:%.*]] = shufflevector <2 x double> [[X0]], <2 x double> [[Y0]], <4 x i32> <i32 1, i32 2, i32 poison, i32 poison>
+; SSE-NEXT:    [[SHUF1:%.*]] = shufflevector <2 x double> [[X1]], <2 x double> poison, <4 x i32> <i32 poison, i32 1, i32 poison, i32 poison>
+; SSE-NEXT:    [[SHUF2:%.*]] = shufflevector <4 x double> [[SHUF0]], <4 x double> [[SHUF1]], <4 x i32> <i32 0, i32 1, i32 5, i32 poison>
+; SSE-NEXT:    [[SHUF3:%.*]] = shufflevector <1 x double> [[TMP1]], <1 x double> poison, <4 x i32> <i32 0, i32 poison, i32 poison, i32 poison>
+; SSE-NEXT:    [[SHUF4:%.*]] = shufflevector <4 x double> [[SHUF2]], <4 x double> [[SHUF3]], <4 x i32> <i32 0, i32 1, i32 2, i32 4>
+; SSE-NEXT:    ret <4 x double> [[SHUF4]]
 ;
   %pxhi = getelementptr inbounds nuw i8, ptr %px, i64 16
   %pyhi = getelementptr inbounds nuw i8, ptr %py, i64 16
@@ -38,7 +51,7 @@ define <4 x double> @interleave_loads(ptr %px, ptr %py) {
 ; The X loads must be adjacent.
 define <4 x double> @nonconsecutive(ptr %px, ptr %py) {
 ; CHECK-LABEL: define <4 x double> @nonconsecutive(
-; CHECK-SAME: ptr [[PX:%.*]], ptr [[PY:%.*]]) #[[ATTR0]] {
+; CHECK-SAME: ptr [[PX:%.*]], ptr [[PY:%.*]]) #[[ATTR0:[0-9]+]] {
 ; CHECK-NEXT:    [[PXHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PX]], i64 32
 ; CHECK-NEXT:    [[PYHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PY]], i64 16
 ; CHECK-NEXT:    [[X0:%.*]] = load <2 x double>, ptr [[PX]], align 16
@@ -163,19 +176,33 @@ define <4 x double> @volatile_load(ptr %px, ptr %py) {
 
 ; Match by element provenance, including commuted operands and multiple root uses.
 define <4 x double> @balanced_tree(ptr %px, ptr %py, ptr %out) {
-; CHECK-LABEL: define <4 x double> @balanced_tree(
-; CHECK-SAME: ptr [[PX:%.*]], ptr [[PY:%.*]], ptr [[OUT:%.*]]) #[[ATTR0]] {
-; CHECK-NEXT:    [[PXHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PX]], i64 16
-; CHECK-NEXT:    [[PYHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PY]], i64 16
-; CHECK-NEXT:    [[X0:%.*]] = load <2 x double>, ptr [[PX]], align 16
-; CHECK-NEXT:    [[Y0:%.*]] = load <2 x double>, ptr [[PY]], align 16
-; CHECK-NEXT:    [[X1:%.*]] = load <2 x double>, ptr [[PXHI]], align 16
-; CHECK-NEXT:    [[Y1:%.*]] = load <2 x double>, ptr [[PYHI]], align 16
-; CHECK-NEXT:    [[LO:%.*]] = shufflevector <2 x double> [[X0]], <2 x double> [[Y0]], <4 x i32> <i32 1, i32 2, i32 poison, i32 poison>
-; CHECK-NEXT:    [[HI:%.*]] = shufflevector <2 x double> [[Y1]], <2 x double> [[X1]], <4 x i32> <i32 3, i32 0, i32 poison, i32 poison>
-; CHECK-NEXT:    [[R:%.*]] = shufflevector <4 x double> [[HI]], <4 x double> [[LO]], <4 x i32> <i32 4, i32 5, i32 0, i32 1>
-; CHECK-NEXT:    store <4 x double> [[R]], ptr [[OUT]], align 1
-; CHECK-NEXT:    ret <4 x double> [[R]]
+; AVX-LABEL: define <4 x double> @balanced_tree(
+; AVX-SAME: ptr [[PX:%.*]], ptr [[PY:%.*]], ptr [[OUT:%.*]]) #[[ATTR0]] {
+; AVX-NEXT:    [[PXHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PX]], i64 16
+; AVX-NEXT:    [[PYHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PY]], i64 16
+; AVX-NEXT:    [[X0:%.*]] = load <2 x double>, ptr [[PX]], align 16
+; AVX-NEXT:    [[Y0:%.*]] = load <2 x double>, ptr [[PY]], align 16
+; AVX-NEXT:    [[X1:%.*]] = load <2 x double>, ptr [[PXHI]], align 16
+; AVX-NEXT:    [[Y1:%.*]] = load <2 x double>, ptr [[PYHI]], align 16
+; AVX-NEXT:    [[TMP1:%.*]] = shufflevector <2 x double> [[X0]], <2 x double> [[X1]], <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+; AVX-NEXT:    [[TMP2:%.*]] = shufflevector <2 x double> [[Y0]], <2 x double> [[Y1]], <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+; AVX-NEXT:    [[R:%.*]] = shufflevector <4 x double> [[TMP1]], <4 x double> [[TMP2]], <4 x i32> <i32 1, i32 4, i32 3, i32 6>
+; AVX-NEXT:    store <4 x double> [[R]], ptr [[OUT]], align 1
+; AVX-NEXT:    ret <4 x double> [[R]]
+;
+; SSE-LABEL: define <4 x double> @balanced_tree(
+; SSE-SAME: ptr [[PX:%.*]], ptr [[PY:%.*]], ptr [[OUT:%.*]]) #[[ATTR0]] {
+; SSE-NEXT:    [[PXHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PX]], i64 16
+; SSE-NEXT:    [[PYHI:%.*]] = getelementptr inbounds nuw i8, ptr [[PY]], i64 16
+; SSE-NEXT:    [[X0:%.*]] = load <2 x double>, ptr [[PX]], align 16
+; SSE-NEXT:    [[Y0:%.*]] = load <2 x double>, ptr [[PY]], align 16
+; SSE-NEXT:    [[X1:%.*]] = load <2 x double>, ptr [[PXHI]], align 16
+; SSE-NEXT:    [[Y1:%.*]] = load <2 x double>, ptr [[PYHI]], align 16
+; SSE-NEXT:    [[LO:%.*]] = shufflevector <2 x double> [[X0]], <2 x double> [[Y0]], <4 x i32> <i32 1, i32 2, i32 poison, i32 poison>
+; SSE-NEXT:    [[HI:%.*]] = shufflevector <2 x double> [[Y1]], <2 x double> [[X1]], <4 x i32> <i32 3, i32 0, i32 poison, i32 poison>
+; SSE-NEXT:    [[R:%.*]] = shufflevector <4 x double> [[HI]], <4 x double> [[LO]], <4 x i32> <i32 4, i32 5, i32 0, i32 1>
+; SSE-NEXT:    store <4 x double> [[R]], ptr [[OUT]], align 1
+; SSE-NEXT:    ret <4 x double> [[R]]
 ;
   %pxhi = getelementptr inbounds nuw i8, ptr %px, i64 16
   %pyhi = getelementptr inbounds nuw i8, ptr %py, i64 16
@@ -316,6 +343,3 @@ define <4 x double> @balanced_narrow(ptr %px, ptr %py) {
   %r = shufflevector <2 x double> %lo, <2 x double> %hi, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
   ret <4 x double> %r
 }
-;; NOTE: These prefixes are unused and the list is autogenerated. Do not add tests below this line:
-; AVX: {{.*}}
-; SSE: {{.*}}

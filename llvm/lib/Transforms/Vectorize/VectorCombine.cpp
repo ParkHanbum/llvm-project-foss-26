@@ -157,6 +157,7 @@ private:
   bool foldBitcastOfVPLoad(Instruction &I);
   bool foldBitOrderReverseAndSwap(Instruction &I);
   bool shrinkType(Instruction &I);
+  bool foldShufflesOfConsecutiveLoads(Instruction &I);
   bool shrinkLoadForShuffles(Instruction &I);
   bool shrinkPhiOfShuffles(Instruction &I);
   bool foldInterleaveOfDeinterleaveChains(Instruction &I);
@@ -6739,6 +6740,91 @@ bool VectorCombine::foldBitOrderReverseAndSwap(Instruction &I) {
   return true;
 }
 
+/// Expose consecutive load pairs before shrinking their unused elements:
+///   {X0[1], Y0[0], X1[1], Y1[0]} -> shuffle(concat(X0, X1), concat(Y0, Y1)).
+/// Keep the loads in place so that memory combining is left to the backend.
+bool VectorCombine::foldShufflesOfConsecutiveLoads(Instruction &I) {
+  auto *Load = cast<LoadInst>(&I);
+  auto *LoadTy = FixedVectorType::get(Builder.getDoubleTy(), 2);
+  auto *WideTy = FixedVectorType::get(Builder.getDoubleTy(), 4);
+  if (Load->getType() != LoadTy || !Load->isSimple() || !Load->hasOneUse() ||
+      !TTI.isTypeLegal(WideTy))
+    return false;
+
+  // Look ahead before shrinkLoadForShuffles loses the complete load sizes.
+  Instruction *Root = Load;
+  unsigned NumVisited = 0;
+  while (Root->hasOneUse()) {
+    auto *Shuf = dyn_cast<ShuffleVectorInst>(*Root->user_begin());
+    if (!Shuf || Shuf->getParent() != Load->getParent())
+      break;
+    if (++NumVisited > Opts.vector_combine_max_scan_instrs)
+      return false;
+    Root = Shuf;
+  }
+  if (Root->getType() != WideTy)
+    return false;
+
+  // Bound the tree before looking through its lanes. Every inner shuffle must
+  // die with Root, so the single-use tree needs no visited set.
+  SmallVector<ShuffleVectorInst *, 8> Shuffles{cast<ShuffleVectorInst>(Root)};
+  for (unsigned Index = 0; Index != Shuffles.size(); ++Index) {
+    for (Value *Op : Shuffles[Index]->operands()) {
+      auto *Shuf = dyn_cast<ShuffleVectorInst>(Op);
+      if (!Shuf)
+        continue;
+      if (!Shuf->hasOneUse() || Shuf->getParent() != Root->getParent())
+        return false;
+      Shuffles.push_back(Shuf);
+    }
+    if (Shuffles.size() > Opts.vector_combine_max_scan_instrs)
+      return false;
+  }
+
+  LoadInst *Loads[4];
+  for (unsigned Index = 0; Index != 4; ++Index) {
+    auto [V, Lane] = lookThroughShuffles(Root, Index);
+    auto *LI = dyn_cast_or_null<LoadInst>(V);
+    if (!LI || LI->getType() != LoadTy || !LI->isSimple() || !LI->hasOneUse() ||
+        LI->getParent() != Load->getParent() || Lane != int(1 - Index % 2))
+      return false;
+    Loads[Index] = LI;
+  }
+
+  // The even output lanes select the high elements of consecutive X loads;
+  // the odd output lanes select the low elements of consecutive Y loads.
+  for (unsigned Index : {0, 1}) {
+    int64_t Offset0, Offset1;
+    Value *Base0 = GetPointerBaseWithConstantOffset(
+        Loads[Index]->getPointerOperand(), Offset0, *DL);
+    Value *Base1 = GetPointerBaseWithConstantOffset(
+        Loads[Index + 2]->getPointerOperand(), Offset1, *DL);
+    if (Base0 != Base1 ||
+        uint64_t(Offset1) - uint64_t(Offset0) != DL->getTypeStoreSize(LoadTy))
+      return false;
+  }
+
+  constexpr int ConcatMask[] = {0, 1, 2, 3};
+  constexpr int Mask[] = {1, 4, 3, 6};
+  InstructionCost OldCost = 0;
+  for (auto *Shuf : Shuffles)
+    OldCost += TTI.getInstructionCost(Shuf, CostKind);
+  InstructionCost NewCost =
+      2 * TTI.getShuffleCost(TTI::SK_PermuteTwoSrc, WideTy, LoadTy, CostKind,
+                             ConcatMask) +
+      TTI.getShuffleCost(TTI::SK_PermuteTwoSrc, WideTy, WideTy, CostKind, Mask);
+  if (!NewCost.isValid() || !OldCost.isValid() || NewCost >= OldCost)
+    return false;
+
+  Builder.SetInsertPoint(Root);
+  Builder.SetCurrentDebugLocation(Root->getDebugLoc());
+  Value *X = Builder.CreateShuffleVector(Loads[0], Loads[2], ConcatMask);
+  Value *Y = Builder.CreateShuffleVector(Loads[1], Loads[3], ConcatMask);
+  Value *Result = Builder.CreateShuffleVector(X, Y, Mask);
+  replaceValue(*Root, *Result);
+  return true;
+}
+
 /// Given the maximum shuffle index and load vector type, compute the number of
 /// elements for the shrunk load, rounding up to the next full vector register
 /// boundary to avoid scalar remainders that legalize poorly.
@@ -7107,6 +7193,8 @@ bool VectorCombine::run() {
           return true;
         break;
       case Instruction::Load:
+        if (foldShufflesOfConsecutiveLoads(I))
+          return true;
         if (shrinkLoadForShuffles(I))
           return true;
         break;
