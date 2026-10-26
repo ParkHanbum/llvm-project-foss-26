@@ -427,7 +427,6 @@ FUNCTION_PASS("constraint-elimination", ConstraintEliminationPass())
 FUNCTION_PASS("copyprof", CopyProfPass())
 FUNCTION_PASS("copyprof-stores", CopyProfStoresPass())
 FUNCTION_PASS("coro-elide", CoroElidePass())
-FUNCTION_PASS("correlated-propagation", CorrelatedValuePropagationPass())
 FUNCTION_PASS("count-visits", CountVisitsPass())
 FUNCTION_PASS("dce", DCEPass())
 FUNCTION_PASS("declare-to-assign", llvm::AssignmentTrackingPass())
@@ -581,6 +580,12 @@ FUNCTION_PASS("wasm-eh-prepare", WasmEHPreparePass())
 #ifndef FUNCTION_PASS_WITH_PARAMS
 #define FUNCTION_PASS_WITH_PARAMS(NAME, CLASS, CREATE_PASS, PARSER, PARAMS)
 #endif
+FUNCTION_PASS_WITH_PARAMS(
+    "correlated-propagation", "CorrelatedValuePropagationPass",
+    [](bool FoldFiniteValues) {
+      return CorrelatedValuePropagationPass(FoldFiniteValues);
+    },
+    parseCorrelatedValuePropagationPassOptions, "finite-values")
 FUNCTION_PASS_WITH_PARAMS(
     "early-cse", "EarlyCSEPass",
     [](bool UseMemorySSA) { return EarlyCSEPass(UseMemorySSA); },

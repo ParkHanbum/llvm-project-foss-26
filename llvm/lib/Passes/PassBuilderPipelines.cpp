@@ -1378,6 +1378,14 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
                                      /*AggregateToVector=*/true)));
   }
 
+  if (Level == OptimizationLevel::O3) {
+    // Vectorization and unrolling can expose small, correlated input sets.
+    // Leave interprocedural evaluation until after inlining, and let SCCP and
+    // the existing InstCombine consume the resulting call-site facts.
+    FPM.addPass(CorrelatedValuePropagationPass(/*FoldFiniteValues=*/true));
+    FPM.addPass(SCCPPass());
+  }
+
   FPM.addPass(InferAlignmentPass());
   FPM.addPass(InstCombinePass());
 

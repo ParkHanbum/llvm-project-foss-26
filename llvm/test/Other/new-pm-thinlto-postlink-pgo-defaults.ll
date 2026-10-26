@@ -173,6 +173,10 @@
 ; CHECK-O-NEXT: Running pass: LoopUnrollPass
 ; CHECK-O-NEXT: Running pass: WarnMissedTransformationsPass
 ; CHECK-O-NEXT: Running pass: SROAPass
+; CHECK-O3-NEXT: Running pass: CorrelatedValuePropagationPass
+; CHECK-O3-NEXT: Running analysis: LazyValueAnalysis
+; CHECK-O3-NEXT: Invalidating analysis: LazyValueAnalysis
+; CHECK-O3-NEXT: Running pass: SCCPPass
 ; CHECK-O-NEXT: Running pass: InferAlignmentPass
 ; CHECK-O-NEXT: Running pass: InstCombinePass
 ; CHECK-O-NEXT: Running pass: LoopSimplifyPass

@@ -955,6 +955,11 @@ Expected<bool> parsePostOrderFunctionAttrsPassOptions(StringRef Params) {
       Params, "skip-non-recursive-function-attrs", "PostOrderFunctionAttrs");
 }
 
+Expected<bool> parseCorrelatedValuePropagationPassOptions(StringRef Params) {
+  return PassBuilder::parseSinglePassOption(Params, "finite-values",
+                                            "CorrelatedValuePropagation");
+}
+
 Expected<bool> parseEarlyCSEPassOptions(StringRef Params) {
   return PassBuilder::parseSinglePassOption(Params, "memssa", "EarlyCSE");
 }

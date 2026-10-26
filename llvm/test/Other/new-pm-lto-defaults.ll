@@ -16,19 +16,19 @@
 ; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-EP
 ; RUN: opt -disable-verify -verify-analysis-invalidation=0 -eagerly-invalidate-analyses=0 -debug-pass-manager \
 ; RUN:     -passes='lto<O3>' -S  %s 2>&1 \
-; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23
+; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-O3
 ; RUN: opt -disable-verify -verify-analysis-invalidation=0 -eagerly-invalidate-analyses=0 -debug-pass-manager \
 ; RUN:     -passes='lto<O3>' -S  %s -passes-ep-vectorizer-start='no-op-function' 2>&1 \
-; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-EP-VECTORIZER-START
+; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-O3,CHECK-EP-VECTORIZER-START
 ; RUN: opt -disable-verify -verify-analysis-invalidation=0 -eagerly-invalidate-analyses=0 -debug-pass-manager \
 ; RUN:     -passes='lto<O3>' -S  %s -passes-ep-vectorizer-end='no-op-function' 2>&1 \
-; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-EP-VECTORIZER-END
+; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-O3,CHECK-EP-VECTORIZER-END
 ; RUN: opt -disable-verify -verify-analysis-invalidation=0 -eagerly-invalidate-analyses=0 -debug-pass-manager \
 ; RUN:     -passes='lto<O3>' -S  %s -passes-ep-peephole='no-op-function' 2>&1 \
-; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-EP-PEEPHOLE
+; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-O3,CHECK-EP-PEEPHOLE
 ; RUN: opt -disable-verify -verify-analysis-invalidation=0 -eagerly-invalidate-analyses=0 -debug-pass-manager \
 ; RUN:     -passes='lto<O3>' -S  %s -passes-ep-cgscc-optimizer-late='no-op-cgscc' 2>&1 \
-; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-EP-CGSCC-LATE
+; RUN:     | FileCheck %s --check-prefixes=CHECK-O,CHECK-O23,CHECK-O3,CHECK-EP-CGSCC-LATE
 
 ; CHECK-EP: Running pass: NoOpModulePass
 ; CHECK-O: Running pass: CrossDSOCFIPass
@@ -142,6 +142,9 @@
 ; CHECK-O23-NEXT: Running pass: BDCEPass on foo
 ; CHECK-O23-NEXT: Running pass: SLPVectorizerPass on foo
 ; CHECK-O23-NEXT: Running pass: VectorCombinePass on foo
+; CHECK-O3-NEXT: Running pass: CorrelatedValuePropagationPass
+; CHECK-O3-NEXT: Invalidating analysis: LazyValueAnalysis
+; CHECK-O3-NEXT: Running pass: SCCPPass
 ; CHECK-O23-NEXT: Running pass: InferAlignmentPass on foo
 ; CHECK-O23-NEXT: Running pass: InstCombinePass on foo
 ; CHECK-O23-NEXT: Running pass: LoopSimplifyPass
@@ -151,6 +154,8 @@
 ; CHECK-EP-VECTORIZER-END-NEXT: Running pass: NoOpFunctionPass on foo
 ; CHECK-EP-PEEPHOLE-NEXT: Running pass: NoOpFunctionPass on foo
 ; CHECK-O23-NEXT: Running pass: JumpThreadingPass on foo
+; CHECK-O3-NEXT: Running analysis: LazyValueAnalysis
+; CHECK-O3-NEXT: Invalidating analysis: LazyValueAnalysis
 ; CHECK-O23-NEXT: Running pass: LowerTypeTestsPass
 ; CHECK-O-NEXT: Running pass: DropTypeTestsPass
 ; CHECK-O23-NEXT: Running pass: LoopSink

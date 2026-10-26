@@ -14,6 +14,7 @@
 #define LLVM_TRANSFORMS_UTILS_EVALUATOR_H
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
@@ -79,8 +80,16 @@ class Evaluator {
   };
 
 public:
-  Evaluator(const DataLayout &DL, const TargetLibraryInfo *TLI)
-      : DL(DL), TLI(TLI) {
+  /// Runtime evaluation must not assume that a mutable global still has its
+  /// initializer's value. It accepts only integer computations and paths with
+  /// no externally visible effects, and bounds the total work across calls.
+  enum class Mode { GlobalInitializer, Runtime };
+
+  Evaluator(const DataLayout &DL, const TargetLibraryInfo *TLI,
+            Mode EvalMode = Mode::GlobalInitializer, unsigned MaxSteps = 256,
+            unsigned MaxCallDepth = 4)
+      : DL(DL), TLI(TLI), EvalMode(EvalMode), StepsLeft(MaxSteps),
+        MaxCallDepth(MaxCallDepth) {
     ValueStack.emplace_back();
   }
 
@@ -99,6 +108,12 @@ public:
   LLVM_ABI bool EvaluateFunction(Function *F, Constant *&RetVal,
                                  const SmallVectorImpl<Constant *> &ActualArgs);
 
+  /// Evaluate an expression in Runtime mode. GetConstant supplies substitutions
+  /// proven at the expression's program point. All uses of a substituted value
+  /// share the same assignment. A failed evaluator must not be reused.
+  LLVM_ABI Constant *
+  EvaluateExpression(Value *V, function_ref<Constant *(Value *)> GetConstant);
+
   DenseMap<GlobalVariable *, Constant *> getMutatedInitializers() const {
     DenseMap<GlobalVariable *, Constant *> Result;
     for (const auto &Pair : MutatedMemory)
@@ -111,6 +126,27 @@ public:
   }
 
 private:
+  using Lookup = function_ref<Constant *(Value *)>;
+
+  Constant *EvaluateExpressionImpl(Value *V, Lookup GetConstant,
+                                   unsigned Depth);
+  Constant *EvaluateRuntimeCall(CallBase &CB, ArrayRef<Constant *> Args);
+  Constant *FoldRuntimeInstruction(Instruction &I, ArrayRef<Constant *> Ops);
+  bool CanEvaluateRuntimeFunction(Function &F, ArrayRef<Constant *> Args) const;
+
+  Constant *getRuntimeVal(Value *V) {
+    if (auto *C = dyn_cast<Constant>(V))
+      return C;
+    return ValueStack.back().lookup(V);
+  }
+
+  bool takeRuntimeStep() {
+    if (!StepsLeft)
+      return false;
+    --StepsLeft;
+    return true;
+  }
+
   bool EvaluateBlock(BasicBlock::iterator CurInst, BasicBlock *&NextBB,
                      bool &StrippedPointerCastsForAliasAnalysis);
 
@@ -167,6 +203,11 @@ private:
 
   const DataLayout &DL;
   const TargetLibraryInfo *TLI;
+
+  Mode EvalMode;
+  unsigned StepsLeft;
+  unsigned MaxCallDepth;
+  DenseMap<Value *, Constant *> ExpressionCache;
 };
 
 } // end namespace llvm

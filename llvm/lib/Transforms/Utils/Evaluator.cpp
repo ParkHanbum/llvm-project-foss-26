@@ -16,8 +16,10 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constant.h"
+#include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -44,6 +46,265 @@ static inline bool
 isSimpleEnoughValueToCommit(Constant *C,
                             SmallPtrSetImpl<Constant *> &SimpleConstants,
                             const DataLayout &DL);
+
+/// ConstantFoldInstOperands deliberately does not preserve poison-generating
+/// flags. Check them before using its result, including each fixed vector lane.
+static bool flagsHold(Instruction &I, ArrayRef<Constant *> Ops) {
+  if (!I.hasPoisonGeneratingFlags())
+    return true;
+  unsigned Lanes = 1;
+  if (auto *VT = dyn_cast<FixedVectorType>(Ops[0]->getType()))
+    Lanes = VT->getNumElements();
+  for (unsigned Lane = 0; Lane != Lanes; ++Lane) {
+    auto GetInt = [&](unsigned Op) -> ConstantInt * {
+      Constant *C = Ops[Op];
+      if (C->getType()->isVectorTy())
+        C = C->getAggregateElement(Lane);
+      return dyn_cast_or_null<ConstantInt>(C);
+    };
+    auto *C0 = GetInt(0);
+    if (!C0)
+      return false;
+    const APInt &A = C0->getValue();
+    if (auto *Trunc = dyn_cast<TruncInst>(&I)) {
+      APInt R = A.trunc(I.getType()->getScalarSizeInBits());
+      if ((Trunc->hasNoUnsignedWrap() && R.zext(A.getBitWidth()) != A) ||
+          (Trunc->hasNoSignedWrap() && R.sext(A.getBitWidth()) != A))
+        return false;
+      continue;
+    }
+    if (isa<ZExtInst>(I)) {
+      if (I.hasNonNeg() && A.isNegative())
+        return false;
+      continue;
+    }
+    auto *C1 = Ops.size() > 1 ? GetInt(1) : nullptr;
+    if (!C1)
+      return false;
+    const APInt &B = C1->getValue();
+    if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
+      if (Cmp->hasSameSign() && A.isNegative() != B.isNegative())
+        return false;
+      continue;
+    }
+    auto *BO = dyn_cast<BinaryOperator>(&I);
+    if (!BO)
+      return false;
+    bool SignedOverflow = false, UnsignedOverflow = false;
+    switch (BO->getOpcode()) {
+    case Instruction::Add:
+      (void)A.sadd_ov(B, SignedOverflow);
+      (void)A.uadd_ov(B, UnsignedOverflow);
+      break;
+    case Instruction::Sub:
+      (void)A.ssub_ov(B, SignedOverflow);
+      (void)A.usub_ov(B, UnsignedOverflow);
+      break;
+    case Instruction::Mul:
+      (void)A.smul_ov(B, SignedOverflow);
+      (void)A.umul_ov(B, UnsignedOverflow);
+      break;
+    case Instruction::Shl:
+      if (B.uge(A.getBitWidth()))
+        return false;
+      (void)A.sshl_ov(B, SignedOverflow);
+      (void)A.ushl_ov(B, UnsignedOverflow);
+      break;
+    case Instruction::LShr:
+    case Instruction::AShr:
+      if (B.uge(A.getBitWidth()) ||
+          (BO->isExact() && A.countTrailingZeros() < B.getZExtValue()))
+        return false;
+      continue;
+    case Instruction::UDiv:
+    case Instruction::SDiv:
+      if (B.isZero() || (BO->getOpcode() == Instruction::SDiv &&
+                         A.isMinSignedValue() && B.isAllOnes()))
+        return false;
+      if (BO->isExact() &&
+          !(BO->getOpcode() == Instruction::UDiv ? A.urem(B) : A.srem(B))
+               .isZero())
+        return false;
+      continue;
+    case Instruction::Or:
+      if (!(A & B).isZero())
+        return false;
+      continue;
+    default:
+      return false;
+    }
+    if ((BO->hasNoSignedWrap() && SignedOverflow) ||
+        (BO->hasNoUnsignedWrap() && UnsignedOverflow))
+      return false;
+  }
+  return true;
+}
+
+Constant *Evaluator::FoldRuntimeInstruction(Instruction &I,
+                                            ArrayRef<Constant *> Ops) {
+  if (I.mayReadOrWriteMemory() || I.mayHaveSideEffects() || I.isTerminator() ||
+      isa<PHINode, FreezeInst>(I) || !I.getType()->isIntOrIntVectorTy())
+    return nullptr;
+  if (Ops.empty() || !flagsHold(I, Ops))
+    return nullptr;
+  // Division by zero (and signed division overflow) is immediate UB, even
+  // when the result would subsequently be masked by a select.
+  if (I.getOpcode() == Instruction::UDiv ||
+      I.getOpcode() == Instruction::SDiv ||
+      I.getOpcode() == Instruction::URem ||
+      I.getOpcode() == Instruction::SRem) {
+    unsigned Lanes = 1;
+    if (auto *VT = dyn_cast<FixedVectorType>(I.getType()))
+      Lanes = VT->getNumElements();
+    for (unsigned Lane = 0; Lane != Lanes; ++Lane) {
+      auto Get = [&](unsigned Op) {
+        return dyn_cast_or_null<ConstantInt>(
+            I.getType()->isVectorTy() ? Ops[Op]->getAggregateElement(Lane)
+                                      : Ops[Op]);
+      };
+      ConstantInt *A = Get(0), *B = Get(1);
+      if (!A || !B || B->isZero() ||
+          ((I.getOpcode() == Instruction::SDiv ||
+            I.getOpcode() == Instruction::SRem) &&
+           A->getValue().isMinSignedValue() && B->isMinusOne()))
+        return nullptr;
+    }
+  }
+  return ConstantFoldInstOperands(&I, Ops, DL, TLI,
+                                  /*AllowNonDeterministic=*/false);
+}
+
+/// An out-of-range call result is poison. In particular, do not turn that
+/// into immediate UB by inferring noundef on a call whose result may be masked.
+static bool constantIsInRange(Constant *C, const ConstantRange &Range) {
+  if (auto *CI = dyn_cast<ConstantInt>(C))
+    return Range.contains(CI->getValue());
+  auto *VT = dyn_cast<FixedVectorType>(C->getType());
+  if (!VT)
+    return false;
+  for (unsigned Lane = 0; Lane != VT->getNumElements(); ++Lane) {
+    auto *CI = dyn_cast_or_null<ConstantInt>(C->getAggregateElement(Lane));
+    if (!CI || !Range.contains(CI->getValue()))
+      return false;
+  }
+  return true;
+}
+
+bool Evaluator::CanEvaluateRuntimeFunction(Function &F,
+                                           ArrayRef<Constant *> Args) const {
+  if (!F.hasExactDefinition() || F.isVarArg() || F.doesNotReturn() ||
+      F.hasFnAttribute(Attribute::OptimizeNone) ||
+      F.hasFnAttribute(Attribute::Naked) ||
+      F.hasFnAttribute(Attribute::StrictFP) ||
+      F.hasFnAttribute(Attribute::Convergent) ||
+      F.hasFnAttribute(Attribute::ReturnsTwice) ||
+      F.hasFnAttribute("loader-replaceable") ||
+      !F.getReturnType()->isIntOrIntVectorTy() ||
+      CallStack.size() >= MaxCallDepth)
+    return false;
+  for (auto [Arg, C] : zip(F.args(), Args)) {
+    if (C->getType() != Arg.getType() || !C->getType()->isIntOrIntVectorTy() ||
+        !isGuaranteedNotToBeUndefOrPoison(C))
+      return false;
+    if (auto R = Arg.getRange())
+      if (!constantIsInRange(C, *R))
+        return false;
+  }
+  return true;
+}
+
+Constant *Evaluator::EvaluateRuntimeCall(CallBase &CB,
+                                         ArrayRef<Constant *> Args) {
+  Function *F = CB.getCalledFunction();
+  if (!isa<CallInst>(CB) || !F || CB.isMustTailCall() ||
+      CB.hasOperandBundles() || CB.isConvergent() ||
+      CB.hasFnAttr(Attribute::ReturnsTwice) ||
+      CB.hasFnAttr("loader-replaceable") ||
+      F->getFunctionType() != CB.getFunctionType() ||
+      F->getCallingConv() != CB.getCallingConv())
+    return nullptr;
+  for (auto [N, C] : enumerate(Args)) {
+    Attribute Range = CB.getParamAttr(N, Attribute::Range);
+    if (Range.isValid() && !constantIsInRange(C, Range.getRange()))
+      return nullptr;
+  }
+  Constant *Result = nullptr;
+  if (F->isIntrinsic()) {
+    // This observes manifest constants in the IR, not just runtime values.
+    // As in simplifyWithOpReplaced(), assumptions must not make it true.
+    if (F->getIntrinsicID() == Intrinsic::is_constant)
+      return nullptr;
+    if (CB.mayHaveSideEffects() || !canConstantFoldCallTo(&CB, F, TLI))
+      return nullptr;
+    Result = ConstantFoldCall(&CB, F, Args, TLI,
+                              /*AllowNonDeterministic=*/false);
+  } else {
+    SmallVector<Constant *, 8> ActualArgs(Args);
+    ValueStack.emplace_back();
+    bool Success = EvaluateFunction(F, Result, ActualArgs);
+    ValueStack.pop_back();
+    if (!Success)
+      return nullptr;
+  }
+  if (Result)
+    if (auto Range = CB.getRange())
+      if (!constantIsInRange(Result, *Range))
+        return nullptr;
+  return Result;
+}
+
+Constant *Evaluator::EvaluateExpression(Value *V, Lookup GetConstant) {
+  assert(EvalMode == Mode::Runtime &&
+         "Expression evaluation needs runtime mode");
+  ExpressionCache.clear();
+  return EvaluateExpressionImpl(V, GetConstant, 0);
+}
+
+Constant *Evaluator::EvaluateExpressionImpl(Value *V, Lookup GetConstant,
+                                            unsigned Depth) {
+  if (auto *C = dyn_cast<Constant>(V))
+    return C;
+  if (Constant *C = ExpressionCache.lookup(V))
+    return C;
+  if (Depth == 32 || !takeRuntimeStep())
+    return nullptr;
+  if (Constant *C = GetConstant(V)) {
+    if (C->getType() != V->getType())
+      return nullptr;
+    return ExpressionCache[V] = C;
+  }
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return nullptr;
+  // In particular, do not visit PHI incoming values at the root's context:
+  // those definitions need not dominate the expression being evaluated.
+  if (!isa<CallInst>(I) &&
+      (I->mayReadOrWriteMemory() || I->mayHaveSideEffects() ||
+       I->isTerminator() || isa<PHINode, FreezeInst>(I) ||
+       !I->getType()->isIntOrIntVectorTy()))
+    return nullptr;
+  SmallVector<Constant *, 8> Ops;
+  if (auto *CI = dyn_cast<CallInst>(I)) {
+    for (Value *Arg : CI->args()) {
+      Constant *C = EvaluateExpressionImpl(Arg, GetConstant, Depth + 1);
+      if (!C)
+        return nullptr;
+      Ops.push_back(C);
+    }
+    if (Constant *C = EvaluateRuntimeCall(*CI, Ops))
+      return ExpressionCache[V] = C;
+    return nullptr;
+  }
+  for (Value *Op : I->operands()) {
+    Constant *C = EvaluateExpressionImpl(Op, GetConstant, Depth + 1);
+    if (!C)
+      return nullptr;
+    Ops.push_back(C);
+  }
+  if (Constant *C = FoldRuntimeInstruction(*I, Ops))
+    return ExpressionCache[V] = C;
+  return nullptr;
+}
 
 /// Return true if the specified constant can be handled by the code generator.
 /// We don't want to generate something like:
@@ -275,6 +536,66 @@ bool Evaluator::EvaluateBlock(BasicBlock::iterator CurInst, BasicBlock *&NextBB,
   // This is the main evaluation loop.
   while (true) {
     Constant *InstResult = nullptr;
+
+    if (EvalMode == Mode::Runtime) {
+      if (!takeRuntimeStep())
+        return false;
+      Instruction &I = *CurInst;
+      if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+        if (!AI->isStaticAlloca() || AI->isUsedWithInAlloca() ||
+            AI->isSwiftError())
+          return false;
+        // Runtime mode never evaluates a load or an escaping stack address.
+        ++CurInst;
+        continue;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand());
+        auto Size = AI ? AI->getAllocationSize(DL) : std::nullopt;
+        TypeSize StoreSize =
+            DL.getTypeStoreSize(SI->getValueOperand()->getType());
+        if (SI->isVolatile() || SI->isAtomic() || !AI ||
+            AI->getFunction() != I.getFunction() || !Size ||
+            Size->isScalable() || StoreSize.isScalable() ||
+            StoreSize.getFixedValue() > Size->getFixedValue() ||
+            SI->getAlign() > AI->getAlign())
+          return false;
+        ++CurInst;
+        continue;
+      }
+      if (isa<DbgInfoIntrinsic>(I)) {
+        ++CurInst;
+        continue;
+      }
+      if (!I.isTerminator()) {
+        SmallVector<Constant *, 8> Ops;
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          for (Value *Arg : CI->args()) {
+            Constant *C = getRuntimeVal(Arg);
+            if (!C)
+              return false;
+            Ops.push_back(C);
+          }
+          InstResult = EvaluateRuntimeCall(*CI, Ops);
+        } else {
+          for (Value *Op : I.operands()) {
+            Constant *C = getRuntimeVal(Op);
+            if (!C)
+              return false;
+            Ops.push_back(C);
+          }
+          InstResult = FoldRuntimeInstruction(I, Ops);
+        }
+        if (!InstResult)
+          return false;
+        if (!I.use_empty())
+          setVal(&I, InstResult);
+        ++CurInst;
+        continue;
+      }
+      if (!isa<UncondBrInst, CondBrInst, SwitchInst, ReturnInst>(I))
+        return false;
+    }
 
     LLVM_DEBUG(dbgs() << "Evaluating Instruction: " << *CurInst << "\n");
 
@@ -598,6 +919,9 @@ bool Evaluator::EvaluateFunction(Function *F, Constant *&RetVal,
                                  const SmallVectorImpl<Constant*> &ActualArgs) {
   assert(ActualArgs.size() == F->arg_size() && "wrong number of arguments");
 
+  if (EvalMode == Mode::Runtime && !CanEvaluateRuntimeFunction(*F, ActualArgs))
+    return false;
+
   // Check to see if this function is already executing (recursion).  If so,
   // bail out.  TODO: we might want to accept limited recursion.
   if (is_contained(CallStack, F))
@@ -643,6 +967,11 @@ bool Evaluator::EvaluateFunction(Function *F, Constant *&RetVal,
           return false;
         }
         RetVal = getVal(RI->getOperand(0));
+        if (EvalMode == Mode::Runtime) {
+          Attribute Range = F->getRetAttribute(Attribute::Range);
+          if (Range.isValid() && !constantIsInRange(RetVal, Range.getRange()))
+            return false;
+        }
       }
       CallStack.pop_back();
       return true;
@@ -658,9 +987,15 @@ bool Evaluator::EvaluateFunction(Function *F, Constant *&RetVal,
     // are any PHI nodes.  If so, evaluate them with information about where
     // we came from.
     PHINode *PN = nullptr;
-    for (CurInst = NextBB->begin();
-         (PN = dyn_cast<PHINode>(CurInst)); ++CurInst)
-      setVal(PN, getVal(PN->getIncomingValueForBlock(CurBB)));
+    for (CurInst = NextBB->begin(); (PN = dyn_cast<PHINode>(CurInst));
+         ++CurInst) {
+      if (EvalMode == Mode::Runtime && !takeRuntimeStep())
+        return false;
+      Constant *C = getRuntimeVal(PN->getIncomingValueForBlock(CurBB));
+      if (!C)
+        return false;
+      setVal(PN, C);
+    }
 
     // Advance to the next block.
     CurBB = NextBB;
