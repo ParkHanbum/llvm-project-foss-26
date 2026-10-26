@@ -21,7 +21,8 @@ define i8 @vf2(ptr %this, i8 %arg) memory(none) {
 
 ; Both targets return 15 for this argument, but not for arbitrary arguments.
 ; CHECK-LABEL: define i8 @constant_arg(
-; CHECK: call i8 %fptr(ptr %obj, i8 5)
+; CHECK-NOT: call i8
+; CHECK: ret i8 15
 define i8 @constant_arg(ptr %obj) {
   %vtable = load ptr, ptr %obj
   %p = call i1 @llvm.type.test(ptr %vtable, metadata !"typeid")

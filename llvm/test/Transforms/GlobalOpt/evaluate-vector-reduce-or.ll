@@ -3,11 +3,11 @@
 ; The reduction operands are computed in the evaluated call frame, rather
 ; than being literal constants at the intrinsic call.
 
-; CHECK: @byte = local_unnamed_addr global i8 0
-; CHECK: @bit = local_unnamed_addr global i1 false
-; CHECK: @wide = local_unnamed_addr global i64 0
+; CHECK: @byte = local_unnamed_addr global i8 -86
+; CHECK: @bit = local_unnamed_addr global i1 true
+; CHECK: @wide = local_unnamed_addr global i64 281474976710659
 ; CHECK: @unsupported = local_unnamed_addr global i8 0
-; CHECK: @llvm.global_ctors = appending global [2 x { i32, ptr, ptr }]
+; CHECK: @llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 1, ptr @init_xor, ptr null }]
 
 @byte = global i8 0
 @bit = global i1 false

@@ -464,6 +464,11 @@ bool Evaluator::EvaluateBlock(BasicBlock::iterator CurInst, BasicBlock *&NextBB,
           LLVM_DEBUG(dbgs() << "Skipping pseudoprobe intrinsic.\n");
           ++CurInst;
           continue;
+        } else if (II->getIntrinsicID() == Intrinsic::vector_reduce_or) {
+          InstResult = ConstantFoldCall(II, II->getCalledFunction(),
+                                        {getVal(II->getArgOperand(0))}, TLI);
+          if (!InstResult)
+            return false;
         } else {
           Value *Stripped = CurInst->stripPointerCastsForAliasAnalysis();
           // Only attempt to getVal() if we've actually managed to strip
